@@ -10,6 +10,8 @@ from warnings import warn
 
 import numpy as np
 
+from spine.utils.logger import logger
+
 
 class ReaderBase:
     """Parent reader class which provides common functions between all readers.
@@ -126,14 +128,10 @@ class ReaderBase:
         self.file_paths = sorted(self.file_paths)
 
         # Print out the list of loaded files
-        print(f"Will load {len(self.file_paths)} file(s):")
-        for i, path in enumerate(self.file_paths):
-            if i < max_print_files:
-                print("  -", path)
-            elif i == max_print_files:
-                print("  ...")
-                break
-        print("")
+        num_files = len(self.file_paths)
+        file_list = " - " + "\n - ".join(self.file_paths[:max_print_files])
+        file_list += "\n ... \n" if num_files > max_print_files else "\n"
+        logger.info("Will load %d file(s):\n%s", num_files, file_list)
 
     def process_run_info(self):
         """Process the run information.
@@ -186,9 +184,10 @@ class ReaderBase:
                    entry_list is not None, skip_entry_list is not None,
                    run_event_list is not None,
                    skip_run_event_list is not None]):
-            assert (bool(n_entry or n_skip) ^
-                    bool(entry_list or skip_entry_list) ^
-                    bool(run_event_list or skip_run_event_list)), (
+            assert ((n_entry is not None or n_skip is not None) ^
+                    (entry_list is not None or skip_entry_list is not None) ^
+                    (run_event_list is not None
+                     or skip_run_event_list is not None)), (
                     "Cannot specify `n_entry` or `n_skip` at the same time "
                     "as `entry_list` or `skip_entry_list` or at the same time "
                     "as `run_event_list` or `skip_run_event_list`.")
@@ -261,7 +260,7 @@ class ReaderBase:
 
         assert len(entry_index), "Must at least have one entry to load."
 
-        print(f"Total number of entries selected: {len(entry_index)}\n")
+        logger.info("Total number of entries selected: %d\n", len(entry_index))
 
         self.entry_index = entry_index
 

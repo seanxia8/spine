@@ -19,11 +19,14 @@ class VertexProcessor(PostBase):
     # Alternative allowed names of the post-processor
     aliases = ('reconstruct_vertex',)
 
+    # Set of post-processors which must be run before this one is
+    _upstream = ('direction',)
+
     def __init__(self, include_shapes=(SHOWR_SHP, TRACK_SHP),
-                 use_primaries=True, update_primaries=False,
-                 anchor_vertex=True, touching_threshold=2.0,
-                 angle_threshold=0.3, run_mode='both',
-                 truth_point_mode='points'):
+                 use_primaries=True, update_orientations=False,
+                 update_primaries=False, anchor_vertex=True,
+                 touching_threshold=2.0, angle_threshold=0.3,
+                 run_mode='both', truth_point_mode='points'):
         """Initialize the vertex finder properties.
 
         Parameters
@@ -32,13 +35,15 @@ class VertexProcessor(PostBase):
             List of semantic classes to consider for vertex reconstruction
         use_primaries : bool, default True
             If true, only considers primary particles to reconstruct the vertex
+        update_orientations : bool, default False
+            Use the reconstructed vertex to update track orientations
         update_primaries : bool, default False
             Use the reconstructed vertex to update primaries
         anchor_vertex : bool, default True
             If true, anchor the candidate vertex to particle objects,
             with the expection of interactions only composed of showers
-        touching_threshold : float, default 2 cm
-            Maximum distance for two track points to be considered touching
+        touching_threshold : float, default 2.0
+            Maximum distance for two track points to be considered touching (cm)
         angle_threshold : float, default 0.3 radians
             Maximum angle between the vertex-to-start-point vector and a shower
             direction to consider that a shower originated from the vertex
@@ -49,6 +54,7 @@ class VertexProcessor(PostBase):
         # Store the relevant parameters
         self.include_shapes = include_shapes
         self.use_primaries = use_primaries
+        self.update_orientations = update_orientations
         self.update_primaries = update_primaries
         self.anchor_vertex = anchor_vertex
         self.touching_threshold = touching_threshold
@@ -107,6 +113,18 @@ class VertexProcessor(PostBase):
             else:
                 inter.reco_vertex = vtx
 
+            # If requested, update track orientations on the basis of the vertex
+            if not inter.is_truth and self.update_orientations:
+                for part in inter.particles:
+                    if part.shape != TRACK_SHP:
+                        continue
+                    elif (np.linalg.norm(inter.vertex - part.start_point)
+                          > np.linalg.norm(inter.vertex - part.end_point)):
+                        part.start_point, part.end_point = (
+                                part.end_point, part.start_point)
+                        part.start_dir, part.end_dir = (
+                                -part.end_dir, -part.start_dir)
+
             # If requested, update primaries on the basis of the vertex
             if not inter.is_truth and self.update_primaries:
                 for part in inter.particles:
@@ -115,6 +133,8 @@ class VertexProcessor(PostBase):
                     elif (np.linalg.norm(part.start_point - inter.vertex) 
                           < self.touching_threshold):
                         part.is_primary = True
-                    elif (part.shape == SHOWR_SHP and
-                          np.dot(part.start_point, inter.vertex) < self.angle_threshold):
-                        part.is_primary = True
+                    elif part.shape == SHOWR_SHP:
+                        vec = part.start_point - inter.vertex
+                        cosang = np.dot(vec/np.linalg.norm(vec), part.start_dir)
+                        if np.arccos(cosang) < self.angle_threshold:
+                            part.is_primary = True

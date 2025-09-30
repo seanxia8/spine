@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from spine.utils.numba_local import cdist
+from spine.math.distance import cdist
 
 
 class BarycenterFlashMatcher:
@@ -59,7 +59,6 @@ class BarycenterFlashMatcher:
         self.min_inter_size   = min_inter_size
         self.min_flash_pe     = min_flash_pe
         self.match_distance   = match_distance
-
 
     def get_matches(self, interactions, flashes):
         """Makes [interaction, flash] pairs that have compatible barycenters.

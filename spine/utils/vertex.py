@@ -1,7 +1,8 @@
 import numpy as np
 import numba as nb
 
-from . import numba_local as nbl
+import spine.math as sm
+
 from .globals import TRACK_SHP, INTER_COL, PRINT_COL, VTX_COLS
 
 
@@ -171,7 +172,7 @@ def get_confluence_points(start_points: nb.float32[:,:],
             for j, (sj, ej) in enumerate(zip(start_points, end_points)):
                 if j > i:
                     pointsj = np.vstack((sj, ej))
-                    submat = nbl.cdist(pointsi, pointsj)
+                    submat = sm.distance.cdist(pointsi, pointsj)
                     mini, minj = np.argmin(submat)//2, np.argmin(submat)%2
                     dist_mat[i,j] = submat[mini, minj]
                     end_mat[i,j], end_mat[j,i] = mini, minj
@@ -187,7 +188,7 @@ def get_confluence_points(start_points: nb.float32[:,:],
 
     # Find cycles to build particle groups and confluence points (vertices)
     leftover  = np.ones(n_part, dtype=np.bool_)
-    max_walks = nbl.amax(walk_mat, axis=1)
+    max_walks = sm.amax(walk_mat, axis=1)
     vertices  = nb.typed.List.empty_list(np.empty(0, dtype=start_points.dtype))
     while np.any(leftover):
         # Find the longest available cycle (must be at least 2 particles)
@@ -203,7 +204,7 @@ def get_confluence_points(start_points: nb.float32[:,:],
 
         # Take the barycenter of the touching particle ends as the vertex
         if end_points is None:
-            vertices.append(nbl.mean(start_points[group], axis=0))
+            vertices.append(sm.mean(start_points[group], axis=0))
         else:
             vertex = np.zeros(3, dtype=start_points.dtype)
             for i, t in enumerate(group):
@@ -243,6 +244,42 @@ def get_pseudovertex(start_points: nb.float32[:,:],
     for p, d in zip(start_points, directions):
         S += (np.outer(d, d) - np.eye(dim, dtype=start_points.dtype))
         C += (np.outer(d, d) - np.eye(dim, dtype=start_points.dtype)) @ np.ascontiguousarray(p)
+
+    pseudovtx = np.linalg.pinv(S) @ C
+
+    return pseudovtx
+
+
+@nb.njit(cache=True)
+def get_weighted_pseudovertex(start_points: nb.float32[:,:],
+                     directions:  nb.float32[:,:],
+                     weights: nb.float32[:],
+                     dim: int = 3) -> nb.float32[:]:
+    """Finds the vertex which minimizes the total distance from itself to all
+    the lines defined by the start points of particles and their directions.
+
+    Parameters
+    ----------
+    start_points : np.ndarray
+        (P, 3) Particle start points
+    directions : np.ndarray
+        (P, 3) Particle directions
+    dim : int
+        Number of dimensions
+    """
+    assert len(start_points), (
+            "Cannot reconstruct pseudovertex without points.")
+
+    if len(start_points) == 1:
+        return start_points[0]
+
+    pseudovtx = np.zeros((dim, ), dtype=start_points.dtype)
+    S = np.zeros((dim, dim), dtype=start_points.dtype)
+    C = np.zeros((dim, ), dtype=start_points.dtype)
+
+    for i, (p, d) in enumerate(zip(start_points, directions)):
+        S += weights[i] * (np.outer(d, d) - np.eye(dim, dtype=start_points.dtype))
+        C += weights[i] * (np.outer(d, d) - np.eye(dim, dtype=start_points.dtype)) @ np.ascontiguousarray(p)
 
     pseudovtx = np.linalg.pinv(S) @ C
 

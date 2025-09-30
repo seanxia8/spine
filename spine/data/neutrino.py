@@ -34,7 +34,7 @@ class Neutrino(PosDataBase):
     pdg_code : int
         PDG code of the neutrino
     lepton_pdg_code : int
-        PDF code of the outgoing lepton
+        PDG code of the outgoing lepton
     current_type : int
         Enumerated current type of the neutrino interaction
     interaction_mode : int
@@ -126,6 +126,9 @@ class Neutrino(PosDataBase):
 
     # String attributes
     _str_attrs = ('creation_process',)
+
+    # Index attributes
+    _index_attrs = ('id', 'interaction_id')
 
     @classmethod
     def from_larcv(cls, neutrino):

@@ -17,14 +17,15 @@ from .layer.common.dbscan import DBSCAN
 # TODO: raname it something more generic like ParticleClusterImageClassifier?
 
 from spine.data import TensorBatch, IndexBatch, RunInfo
+
+from spine.utils.logger import logger
 from spine.utils.globals import (
         COORD_COLS, VALUE_COL, CLUST_COL, SHAPE_COL, SHOWR_SHP, TRACK_SHP,
         MICHL_SHP, DELTA_SHP, GHOST_SHP)
+from spine.utils.ghost import ChargeRescaler
 from spine.utils.calib import CalibrationManager
-from spine.utils.logger import logger
-from spine.utils.ppn import get_particle_points
-from spine.utils.ghost import (
-        compute_rescaled_charge_batch, adapt_labels_batch)
+from spine.utils.ppn import ParticlePointPredictor
+from spine.utils.cluster.label import ClusterLabelAdapter
 from spine.utils.gnn.cluster import (
         form_clusters_batch, get_cluster_label_batch)
 from spine.utils.gnn.evaluation import primary_assignment_batch
@@ -115,10 +116,10 @@ class FullChain(torch.nn.Module):
     )
 
     def __init__(self, chain, uresnet_deghost=None, uresnet=None,
-                 uresnet_ppn=None, adapt_labels=None, graph_spice=None,
-                 dbscan=None, grappa_shower=None, grappa_track=None,
-                 grappa_particle=None, grappa_inter=None, calibration=None,
-                 uresnet_deghost_loss=None, uresnet_loss=None,
+                 uresnet_ppn=None, adapt_labels=None, predict_points=None,
+                 graph_spice=None, dbscan=None, grappa_shower=None,
+                 grappa_track=None, grappa_particle=None, grappa_inter=None,
+                 calibration=None, uresnet_deghost_loss=None, uresnet_loss=None,
                  uresnet_ppn_loss=None, graph_spice_loss=None,
                  grappa_shower_loss=None, grappa_track_loss=None,
                  grappa_particle_loss=None, grappa_inter_loss=None):
@@ -134,6 +135,8 @@ class FullChain(torch.nn.Module):
             Segmentation and point proposal model configuration
         adapt_labels : dict, optional
             Parameters for the cluster label adaptation (if non-standard)
+        predict_points : dict, optional
+            Parameters for the particle point predictor (if non-standard)
         dbscan : dict, optional
             Connected component clustering configuration
         graph_spice : dict, optional
@@ -162,6 +165,11 @@ class FullChain(torch.nn.Module):
                     "`uresnet_deghost` configuration block.")
             self.uresnet_deghost = UResNetSegmentation(uresnet_deghost)
 
+        # Initialize the charge rescaling process (adapt to ghost predictions)
+        if self.charge_rescaling is not None:
+            self.charge_rescaler = ChargeRescaler(
+                    collection_only=self.charge_rescaling == 'collection')
+
         # Initialize the semantic segmentation model (+ point proposal)
         if self.segmentation is not None and self.segmentation == 'uresnet':
             assert (uresnet is not None) ^ (uresnet_ppn is not None), (
@@ -173,8 +181,10 @@ class FullChain(torch.nn.Module):
                 self.uresnet_ppn = UResNetPPN(**uresnet_ppn)
 
         # Initialize the relabeling process (adapt to the semantic predictions)
-        # TODO: make this a class which holds onto these parameters?
-        self.adapt_params = adapt_labels if adapt_labels is not None else {}
+        self.label_adapter = ClusterLabelAdapter(**(adapt_labels or {}))
+
+        # Initialize the point predictor (for fragment/particle clusters)
+        self.point_predictor = ParticlePointPredictor(**(predict_points or {}))
 
         # Initialize the dense clustering model
         self.fragment_shapes = []
@@ -359,8 +369,7 @@ class FullChain(torch.nn.Module):
 
             # Rescale the charge, if requested
             if self.charge_rescaling is not None:
-                charges = compute_rescaled_charge_batch(
-                        data_adapt, self.charge_rescaling == 'collection')
+                charges = self.charge_rescaler(data_adapt)
                 tensor_deghost = data_adapt.tensor[:, :-6]
                 tensor_deghost[:, VALUE_COL] = charges
                 data_adapt.data = tensor_deghost
@@ -495,9 +504,8 @@ class FullChain(torch.nn.Module):
             if seg_label is not None and clust_label is not None:
                 seg_pred = self.result['seg_pred']
                 ghost_pred = self.result.get('ghost_pred', None)
-                clust_label = adapt_labels_batch(
-                        clust_label, seg_label, seg_pred, ghost_pred,
-                        **self.adapt_params)
+                clust_label = self.label_adapter(
+                        clust_label, seg_label, seg_pred, ghost_pred)
 
                 self.result['clust_label_adapt'] = clust_label
 
@@ -679,8 +687,20 @@ class FullChain(torch.nn.Module):
         # Store merged fragment properties, if needed
         if merge:
             for key, value in merge.items():
+                # Convert to a TensorBatch
+                coord_cols = np.array([0, 1, 2]) if key.endswith('points') else None
                 self.result[f'fragment_{key}'] = TensorBatch(
-                        value, counts=fragments.counts)
+                        value, counts=fragments.counts, coord_cols=coord_cols)
+
+                # For group predictions, reorganize them by batch entry
+                if key == 'group_pred':
+                    group_pred = self.result[f'fragment_{key}']
+                    offset = 0
+                    for b, group_pred_b in enumerate(group_pred.split()):
+                        lower, upper = group_pred.edges[b], group_pred.edges[b+1]
+                        group_pred_b = np.unique(group_pred_b, return_inverse=True)[-1]
+                        group_pred.data[lower:upper] = offset + group_pred_b
+                        offset += len(group_pred_b)
 
         # Store particle objects
         self.result['particle_clusts'] = particles
@@ -1019,7 +1039,7 @@ class FullChain(torch.nn.Module):
                 ref_clusts = clust_primaries
 
             # Get and store the points
-            points = get_particle_points(
+            points = self.point_predictor(
                     data, ref_clusts, clust_shapes, self.result['ppn_points'])
 
             grappa_input['points'] = points
@@ -1180,24 +1200,26 @@ class FullChainLoss(torch.nn.Module):
         process_chain_config(self, **chain)
 
         # Initialize the deghosting loss
-        if self.deghosting == 'uresnet':
+        if self.deghosting == 'uresnet' and uresnet_deghost_loss is not None:
             self.deghost_loss = SegmentationLoss(
                     uresnet_deghost, uresnet_deghost_loss)
 
         # Initialize the segmentation/PPN losses
         if self.segmentation == 'uresnet':
-            assert ((uresnet_loss is not None) ^
-                    (uresnet_ppn_loss is not None)), (
-                    "If the segmentation is using UResNet, must provide the "
+            assert not ((uresnet_loss is not None) and
+                        (uresnet_ppn_loss is not None)), (
+                    "If the segmentation is using UResNet, can provide either "
                     "`uresnet_loss` or `uresnet_ppn_loss` configuration block.")
             if uresnet_loss is not None:
                 self.uresnet_loss = SegmentationLoss(uresnet, uresnet_loss)
-            else:
+            elif uresnet_ppn_loss is not None:
                 self.uresnet_ppn_loss = UResNetPPNLoss(
                         **uresnet_ppn, **uresnet_ppn_loss)
 
         # Initialize the graph-SPICE loss
-        if self.fragmentation is not None and 'graph_spice' in self.fragmentation:
+        if (self.fragmentation is not None and
+            'graph_spice' in self.fragmentation and
+            graph_spice_loss is not None):
             self.graph_spice_loss = GraphSPICELoss(graph_spice, graph_spice_loss)
 
         # Initialize the GraPA lossses
@@ -1206,11 +1228,9 @@ class FullChainLoss(torch.nn.Module):
                 'particle': grappa_particle_loss, 'inter': grappa_inter_loss
         }
         for stage, config in self.grappa_losses.items():
-            if getattr(self, f'{stage}_aggregation') == 'grappa':
+            if (getattr(self, f'{stage}_aggregation') == 'grappa' and
+                config is not None):
                 name = f'grappa_{stage}_loss'
-                assert config is not None, (
-                        f"If the {stage} aggregation is done using GrapPA, "
-                        f"must provide the {name} configuration block.")
                 setattr(self, name, GrapPALoss(config))
 
     @property
@@ -1267,7 +1287,7 @@ class FullChainLoss(torch.nn.Module):
         self.result = {'accuracy': 1., 'loss': 0., 'num_losses': 0}
 
         # Apply the deghosting loss
-        if self.deghosting == 'uresnet':
+        if self.deghosting == 'uresnet' and hasattr(self, 'deghost_loss'):
             # Convert segmentation labels to ghost labels
             ghost_label_tensor = seg_label.tensor.clone()
             ghost_label_tensor[:, SHAPE_COL] = (
@@ -1299,13 +1319,13 @@ class FullChainLoss(torch.nn.Module):
             # reconstructed semantic segmentation of the image
             clust_label = clust_label_adapt
 
-            # Store the loss dictionary
+            # Store the loss dictionary, if requested
             if hasattr(self, 'uresnet_loss'):
                 res_seg = self.uresnet_loss(
                         seg_label=seg_label, segmentation=segmentation)
                 self.update_result(res_seg, 'uresnet')
 
-            else:
+            elif hasattr(self, 'uresnet_ppn_loss'):
                 res_seg = self.uresnet_ppn_loss(
                         seg_label=seg_label, ppn_label=ppn_label,
                         clust_label=clust_label, segmentation=segmentation,
@@ -1313,7 +1333,9 @@ class FullChainLoss(torch.nn.Module):
                 self.update_result(res_seg)
 
         # Apply the Graph-SPICE loss
-        if self.fragmentation is not None and 'graph_spice' in self.fragmentation:
+        if (self.fragmentation is not None and
+            'graph_spice' in self.fragmentation and
+            hasattr(self, 'graph_spice_loss')):
             # Prepare Graph-SPICE loss input
             loss_dict = {}
             for key, value in output.items():
@@ -1328,9 +1350,10 @@ class FullChainLoss(torch.nn.Module):
 
         # Apply the aggregation losses
         for stage in self.grappa_losses.keys():
-            if getattr(self, f'{stage}_aggregation') == 'grappa':
+            name = f'grappa_{stage}_loss'
+            if (getattr(self, f'{stage}_aggregation') == 'grappa' and
+                hasattr(self, name)):
                 # Prepare the input to the loss function
-                name = f'grappa_{stage}_loss'
                 prefix = f'{stage}_fragment' if stage != 'inter' else 'particle'
                 loss_dict = {}
                 for k, v in output.items():

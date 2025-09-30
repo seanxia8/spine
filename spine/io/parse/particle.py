@@ -12,14 +12,17 @@ Contains the following parsers:
 
 import numpy as np
 
-from spine.data import Meta, Particle, Neutrino, ObjectList
+from spine.data import Meta, Particle, Neutrino
 
-from spine.utils.globals import TRACK_SHP, PDG_TO_PID, PID_MASSES
+from spine.utils.globals import (
+        TRACK_SHP, PDG_TO_PID, PID_MASSES, INVAL_ID, VALUE_COL, PPN_LPART_COL)
 from spine.utils.particles import process_particles
 from spine.utils.ppn import get_ppn_labels, get_vertex_labels, image_coordinates
+from spine.utils.gnn.network import filter_invalid_nodes
 from spine.utils.conditional import larcv
 
 from .base import ParserBase
+from .data import ParserTensor, ParserObjectList
 
 __all__ = ['ParticleParser', 'NeutrinoParser', 'ParticlePointParser',
            'ParticleCoordinateParser', 'VertexPointParser', 'ParticleGraphParser',
@@ -43,6 +46,9 @@ class ParticleParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'particle'
+
+    # Type of object(s) returned by the parser
+    returns = 'object_list'
 
     def __init__(self, pixel_coordinates=True, post_process=True,
                  skip_empty=False, asis=False, **kwargs):
@@ -118,7 +124,7 @@ class ParticleParser(ParserBase):
             assert not self.skip_empty, (
                     "If `asis` is True`, `skip_empty` must be False.")
 
-            return ObjectList(particle_list, larcv.Particle())
+            return ParserObjectList(particle_list, larcv.Particle())
 
         # Convert to a list of particle objects
         particles = []
@@ -150,7 +156,20 @@ class ParticleParser(ParserBase):
                 if p.id > -1:
                     p.to_px(meta)
 
-        return ObjectList(particles, Particle())
+        # Define the shifts to be applied to each index attribute
+        num_particles = len(particles)
+        if neutrino_event is not None:
+            num_neutrinos = len(neutrino_event.as_vector())
+        else:
+            nu_ids = np.array([part.nu_id for part in particles], dtype=int)
+            num_neutrinos = np.max(nu_ids, initial=-1) + 1
+
+        index_shifts = {}
+        for attr in Particle().index_attrs:
+            index_shifts[attr] = num_particles if attr != 'nu_id' else num_neutrinos
+
+        # Return
+        return ParserObjectList(particles, Particle(), index_shifts)
 
 
 class NeutrinoParser(ParserBase):
@@ -169,6 +188,9 @@ class NeutrinoParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'neutrino'
+
+    # Type of object(s) returned by the parser
+    returns = 'object_list'
 
     def __init__(self, pixel_coordinates=True, asis=False, **kwargs):
         """Initialize the parser.
@@ -225,7 +247,7 @@ class NeutrinoParser(ParserBase):
             assert not self.pixel_coordinates, (
                     "If `asis` is True, `pixel_coordinates` must be False.")
 
-            return ObjectList(neutrino_list, larcv.Neutrino())
+            return ParserObjectList(neutrino_list, larcv.Neutrino())
 
         # Convert to a list of neutrino objects
         neutrinos = [Neutrino.from_larcv(n) for n in neutrino_list]
@@ -244,7 +266,13 @@ class NeutrinoParser(ParserBase):
             for n in neutrinos:
                 n.to_px(meta)
 
-        return ObjectList(neutrinos, Neutrino())
+        # Define the shifts to be applied to each index attribute
+        inter_ids = [n.interaction_id for n in neutrinos]
+        num_neutrinos = len(neutrino_event.as_vector())
+        max_inter = np.max(inter_ids, initial=-1) + 1
+        index_shifts = {'id': num_neutrinos, 'interaction_id': max_inter}
+
+        return ParserObjectList(neutrinos, Neutrino(), index_shifts)
 
 
 class ParticlePointParser(ParserBase):
@@ -265,6 +293,9 @@ class ParticlePointParser(ParserBase):
     # Name of the parser (as specified in the configuration)
     name = 'particle_points'
 
+    # Type of object(s) returned by the parser
+    returns = 'tensor'
+
     def __init__(self, include_point_tagging=True, **kwargs):
         """Initialize the parser.
 
@@ -280,6 +311,9 @@ class ParticlePointParser(ParserBase):
 
         # Store the revelant attributes
         self.include_point_tagging = include_point_tagging
+
+        # Define the output columns containing indexes
+        self.index_cols = np.array([PPN_LPART_COL])
 
     def __call__(self, trees):
         """Parse one entry.
@@ -327,7 +361,10 @@ class ParticlePointParser(ParserBase):
                 particle_v, meta, self.ftype,
                 include_point_tagging=self.include_point_tagging)
 
-        return point_labels[:, :3], point_labels[:, 3:], Meta.from_larcv(meta)
+        return ParserTensor(
+                coords=point_labels[:, :3], features=point_labels[:, 3:],
+                meta=Meta.from_larcv(meta), index_cols=self.index_cols,
+                index_shifts=np.array([particle_event.size()]))
 
 
 class ParticleCoordinateParser(ParserBase):
@@ -346,6 +383,9 @@ class ParticleCoordinateParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'particle_coords'
+
+    # Type of object(s) returned by the parser
+    returns = 'tensor'
 
     def __call__(self, trees):
         """Parse one entry.
@@ -392,15 +432,17 @@ class ParticleCoordinateParser(ParserBase):
         particle_v = particle_event.as_vector()
 
         # Make features
-        features = np.empty((len(particle_v), 8), dtype=self.ftype)
+        coord_labels = np.empty((len(particle_v), 8), dtype=self.ftype)
         for i, p in enumerate(particle_v):
             start_point = last_point = image_coordinates(meta, p.first_step())
             if p.shape() == TRACK_SHP: # End point only meaningful for tracks
                 last_point = image_coordinates(meta, p.last_step())
             extra = [p.t(), p.shape()]
-            features[i] = np.concatenate((start_point, last_point, extra))
+            coord_labels[i] = np.concatenate((start_point, last_point, extra))
 
-        return features[:, :6], features[:, 6:], Meta.from_larcv(meta)
+        return ParserTensor(
+                coords=coord_labels[:, :6], features=coord_labels[:, 6:],
+                meta=Meta.from_larcv(meta))
 
 
 class VertexPointParser(ParserBase):
@@ -425,6 +467,23 @@ class VertexPointParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'vertex_points'
+
+    # Type of object(s) returned by the parser
+    returns = 'tensor'
+
+    def __init__(self, **kwargs):
+        """Initialize the parser.
+
+        Parameters
+        ----------
+        **kwargs : dict, optional
+            Data product arguments to be passed to the `process` function
+        """
+        # Initialize the parent class
+        super().__init__(**kwargs)
+
+        # Define the output columns containing indexes
+        self.index_cols = np.array([VALUE_COL])
 
     def __call__(self, trees):
         """Parse one entry.
@@ -480,7 +539,13 @@ class VertexPointParser(ParserBase):
         point_labels = get_vertex_labels(
                 particle_v, neutrino_v, meta, self.ftype)
 
-        return point_labels[:, :3], point_labels[:, 3:], Meta.from_larcv(meta)
+        # Get the index shift to apply
+        index_shifts = np.max(point_labels[:, 0], keepdims=True, initial=-1) + 1
+
+        return ParserTensor(
+                coords=point_labels[:, :3], features=point_labels[:, 3:],
+                meta=Meta.from_larcv(meta), index_cols=self.index_cols,
+                index_shifts=index_shifts)
 
 
 class ParticleGraphParser(ParserBase):
@@ -494,11 +559,30 @@ class ParticleGraphParser(ParserBase):
             parser: particle_graph
             particle_event: particle_pcluster
             cluster_event: cluster3d_pcluster
-
+            include_fragment_edges: false
     """
 
     # Name of the parser (as specified in the configuration)
     name = 'particle_graph'
+
+    # Type of object(s) returned by the parser
+    returns = 'tensor'
+
+    def __init__(self, include_fragment_edges=False, **kwargs):
+        """Initialize the parser.
+
+        Parameters
+        ----------
+        include_fragment_edges : bool, default False
+            If `True`, includes edges which join particles in the same group
+        **kwargs : dict, optional
+            Data product arguments to be passed to the `process` function
+        """
+        # Initialize the parent class
+        super().__init__(**kwargs)
+
+        # Store the revelant attributes
+        self.include_fragment_edges = include_fragment_edges
 
     def __call__(self, trees):
         """Parse one entry.
@@ -529,73 +613,49 @@ class ParticleGraphParser(ParserBase):
         int
             Number of particles in the input
         """
+        # Check on the cluster input, if provided
         particles_v   = particle_event.as_vector()
         num_particles = particles_v.size()
-        edges         = []
-        if cluster_event is None:
-            # Fill edges (directed [parent, child] pair)
-            edges = []
-            for cluster_id in range(num_particles):
-                p = particles_v[cluster_id]
-                if p.parent_id() != p.id():
-                    edges.append([int(p.parent_id()), cluster_id])
-                if p.parent_id() == p.id() and p.group_id() != p.id():
-                    edges.append([int(p.group_id()), cluster_id])
-
-            # Convert the list of edges to a numpy array
-            if not edges:
-                return np.empty((2, 0), dtype=np.int64), num_particles
-
-            edges = np.vstack(edges).astype(np.int64)
-
-        else:
-            # Check that the cluster and particle objects are consistent
-            num_clusters = cluster_event.size()
+        if cluster_event is not None:
+            # Check that the cluster list is of the expected length
+            clusters_v = cluster_event.as_vector()
+            num_clusters = len(clusters_v)
             assert (num_particles == num_clusters or
                     num_particles == num_clusters - 1), (
                     f"The number of particles ({num_particles}) must be "
                     f"aligned with the number of clusters ({num_clusters}). "
-                    f"There can me one more catch-all cluster at the end.")
+                     "There can me one more catch-all cluster at the end.")
 
-            # Fill edges (directed [parent, child] pair)
-            zero_nodes, zero_nodes_pid = [], []
-            for cluster_id in range(num_particles):
-                cluster = cluster_event.as_vector()[cluster_id]
-                num_points = cluster.as_vector().size()
-                p = particles_v[cluster_id]
-                if p.id() != p.group_id():
-                    continue
-                if p.parent_id() != p.group_id():
-                    edges.append([int(p.parent_id()), p.group_id()])
-                if num_points == 0:
-                    zero_nodes.append(p.group_id())
-                    zero_nodes_pid.append(cluster_id)
+        # Build a list of edges
+        edges, zero_nodes = [], []
+        for cluster_id, part in enumerate(particles_v):
+            # If the parent ID is invalid (broken parentage), skip
+            if part.parent_id() == INVAL_ID:
+                continue
 
-            # Convert the list of edges to a numpy array
-            if not edges:
-                return np.empty((2, 0), dtype=np.int64), num_particles
+            # Only include edges within particle groups if explicitely requested
+            if not self.include_fragment_edges and part.group_id() != cluster_id:
+                continue
 
+            # Add edge between particle and its direct parent
+            if part.parent_id() != part.group_id():
+                edges.append([int(part.parent_id()), cluster_id])
+
+            # If the cluster event is provided, keep track of empty nodes
+            if cluster_event is not None and clusters_v[cluster_id].size() == 0:
+                zero_nodes.append(cluster_id)
+
+        # Convert the list of edges to a numpy array
+        if not edges:
+            edges = np.empty((0, 2), dtype=np.int64)
+        else:
             edges = np.vstack(edges).astype(np.int64)
 
-            # Remove zero pixel nodes
-            for zn in zero_nodes:
-                children = np.where(edges[:, 0] == zn)[0]
-                if len(children) == 0:
-                    edges = edges[edges[:, 0] != zn]
-                    edges = edges[edges[:, 1] != zn]
-                    continue
-                parent = np.where(edges[:, 1] == zn)[0]
-                assert len(parent) <= 1
+        # Remove zero-pixel nodes, if possible
+        if len(zero_nodes) > 0 and len(edges) > 0:
+            edges = filter_invalid_nodes(edges, zero_nodes)
 
-                # If zero node has a parent, then assign children to that parent
-                if len(parent) == 1:
-                    parent_id = edges[parent][0][0]
-                    edges[:, 0][children] = parent_id
-                else:
-                    edges = edges[edges[:, 0] != zn]
-                edges = edges[edges[:, 1] != zn]
-
-        return edges.T, num_particles
+        return ParserTensor(features=edges.T, global_shift=num_particles)
 
 
 class SingleParticlePIDParser(ParserBase):
@@ -611,6 +671,12 @@ class SingleParticlePIDParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'single_particle_pid'
+
+    # Type of object(s) returned by the parser
+    returns = 'scalar'
+
+    # Overlay strategy for the objects returned by the parser
+    overlay = 'cat'
 
     def __call__(self, trees):
         """Parse one entry.
@@ -659,6 +725,12 @@ class SingleParticleEnergyParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'single_particle_energy'
+
+    # Type of object(s) returned by the parser
+    returns = 'scalar'
+
+    # Overlay strategy for the objects returned by the parser
+    overlay = 'cat'
 
     def __call__(self, trees):
         """Parse one entry.

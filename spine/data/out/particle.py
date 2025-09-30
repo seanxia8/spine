@@ -7,7 +7,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 from spine.utils.globals import (
-        TRACK_SHP, SHAPE_LABELS, PID_LABELS, PID_MASSES, PID_TO_PDG)
+        SHOWR_SHP, TRACK_SHP, SHAPE_LABELS, PID_LABELS, PID_MASSES, PID_TO_PDG)
 from spine.utils.decorators import inherit_docstring
 
 from spine.data.particle import Particle
@@ -24,7 +24,7 @@ class ParticleBase:
     Attributes
     ----------
     fragments : List[object]
-        List of fragments that make up the interaction
+        List of fragments that make up this particle
     fragment_ids : np.ndarray
         List of Fragment IDs that make up this particle
     num_fragments : int
@@ -35,8 +35,13 @@ class ParticleBase:
         Semantic type (shower (0), track (1), Michel (2), delta (3),
         low energy scatter (4)) of this particle
     pid : int
-        Particle spcies (Photon (0), Electron (1), Muon (2), Charged Pion (3),
-        Proton (4)) of this particle
+        Particle species (Photon (0), Electron (1), Muon (2), Charged Pion (3),
+        Proton (4), Kaon (5)) of this particle
+    chi2_pid : int
+        Particle species as predicted by the chi2 template method (Muon (2),
+        Charged Pion (3), Proton (4), Kaon (5)) of this particle
+    chi2_per_pid : np.ndarray
+        (P) Array of chi2 values associated with each particle class
     pdg_code : int
         PDG code corresponding to the PID number
     is_primary : bool
@@ -61,15 +66,23 @@ class ParticleBase:
     csda_ke : float
         Kinetic energy reconstructed from the particle range in MeV
     csda_ke_per_pid : np.ndarray
-        Same as `csda_ke` but for every available track PID hypothesis
+        (P) Same as `csda_ke` but for every available track PID hypothesis
     mcs_ke : float
         Kinetic energy reconstructed using the MCS method in MeV
     mcs_ke_per_pid : np.ndarray
-        Same as `mcs_ke` but for every available track PID hypothesis
+        (P) Same as `mcs_ke` but for every available track PID hypothesis
     momentum : np.ndarray
         3-momentum of the particle at the production point in MeV/c
     p : float
         Momentum magnitude of the particle at the production point in MeV/c
+    is_crt_matched : bool
+        True if the particle was matched to a CRT hit
+    crt_ids : np.ndarray
+        (C) Indices of the CRT hits the particle is matched to
+    crt_times : np.ndarray
+        (C) Times at which the CRT hits occurred in microseconds
+    crt_scores : np.ndarray
+        (C) Quality metric associated with the CRT matches
     is_valid : bool
         Whether this particle counts towards an interaction topology. This
         may be False if a particle is below some defined energy threshold.
@@ -80,6 +93,8 @@ class ParticleBase:
     interaction_id: int = -1
     shape: int = -1
     pid: int = -1
+    chi2_pid: int = -1
+    chi2_per_pid: np.ndarray = None
     pdg_code: int = -1
     is_primary: bool = False
     length: float = -1.
@@ -96,19 +111,26 @@ class ParticleBase:
     mcs_ke_per_pid: np.ndarray = None
     momentum: np.ndarray = None
     p: float = None
+    is_crt_matched: bool = False
+    crt_ids: np.ndarray = None
+    crt_times: np.ndarray = None
+    crt_scores: np.ndarray = None
     is_valid: bool = True
 
     # Fixed-length attributes
     _fixed_length_attrs = (
             ('start_point', 3), ('end_point', 3), ('start_dir', 3),
             ('end_dir', 3), ('momentum', 3),
+            ('chi2_per_pid', len(PID_LABELS) - 1),
             ('csda_ke_per_pid', len(PID_LABELS) - 1),
             ('mcs_ke_per_pid', len(PID_LABELS) - 1)
     )
 
     # Variable-length attributes as (key, dtype) pairs
     _var_length_attrs = (
-            ('fragments', object), ('fragment_ids', np.int32)
+            ('fragments', object), ('fragment_ids', np.int32),
+            ('crt_ids', np.int32), ('crt_times', np.float32),
+            ('crt_scores', np.float32)
     )
 
     # Attributes specifying coordinates
@@ -118,7 +140,7 @@ class ParticleBase:
     _vec_attrs = ('start_dir', 'end_dir', 'momentum')
 
     # Boolean attributes
-    _bool_attrs = ('is_primary', 'is_valid')
+    _bool_attrs = ('is_primary', 'is_crt_matched', 'is_valid')
 
     # Enumerated attributes
     _enum_attrs = (
@@ -142,6 +164,24 @@ class ParticleBase:
         return (f"Particle(ID: {self.id:<3} | PID: {pid_label:<8} "
                 f"| Primary: {self.is_primary:<2} "
                 f"| Size: {self.size:<5} | Match: {match:<3})")
+
+    def reset_crt_match(self, typed=True):
+        """Reset all the CRT hit matching attributes.
+
+        Parameters
+        ----------
+        typed : bool, default True
+            If `True`, the underlying arrays are reset to typed empty arrays
+        """
+        self.is_crt_matched = False
+        if typed:
+            self.crt_ids = np.empty(0, dtype=np.int32)
+            self.crt_times = np.empty(0, dtype=np.float32)
+            self.crt_scores = np.empty(0, dtype=np.float32)
+        else:
+            self.crt_ids = []
+            self.crt_times = []
+            self.crt_scores = []
 
     @property
     def num_fragments(self):
@@ -197,26 +237,38 @@ class RecoParticle(ParticleBase, RecoBase):
     Attributes
     ----------
     pid_scores : np.ndarray
-        (P) Array of softmax scores associated with each of particle class
+        (P) Array of softmax scores associated with each particle class
     primary_scores : np.ndarray
         (2) Array of softmax scores associated with secondary and primary
     ppn_ids : np.ndarray
         (M) List of indexes of PPN points associated with this particle
     ppn_points : np.ndarray
         (M, 3) List of PPN points tagged to this particle
-    vertex_distance: float
+    vertex_distance : float
         Set-to-point distance between all particle points and the parent
-        interaction vertex. (untis of cm)
-    shower_split_angle: float
-        Estimate of the opening angle of the shower. If particle is not a
-        shower, then this is set to -1. (units of degrees)
+        interaction vertex position in cm
+    start_dedx : float
+        dE/dx around a user-defined neighborhood of the start point in MeV/cm
+    end_dedx : float
+        dE/dx around a user-defined neighborhood of the end point in MeV/cm
+    start_straightness : float
+        Explained variance ratio of the beginning of the particle
+    directional_spread : float
+        Estimate of the angular spread of the particle (cosine spread)
+    axial_spread : float
+        Pearson correlation coefficient of the axial profile of the particle
+        w.r.t. to the distance from its start point
     """
     pid_scores: np.ndarray = None
     primary_scores: np.ndarray = None
     ppn_ids: np.ndarray = None
     ppn_points: np.ndarray = None
     vertex_distance: float = -1.
-    shower_split_angle: float = -1.
+    start_dedx: float = -1.
+    end_dedx: float = -1.
+    start_straightness: float = -1.
+    directional_spread: float = -1.
+    axial_spread: float = -np.inf
 
     # Fixed-length attributes
     _fixed_length_attrs = (
@@ -257,19 +309,34 @@ class RecoParticle(ParticleBase, RecoBase):
     def merge(self, other):
         """Merge another particle instance into this one.
 
-        This method can only merge two track objects with well defined start
-        and end points.
+        The merging strategy differs depending on the the particle shapes
+        merged together. There are two categories:
+        - Track + track
+          - The start/end points are produced by finding the combination of points
+            which are farthest away from each other (one from each constituent)
+          - The primary scores/primary status match that of the constituent
+            particle with the highest primary score
+          - The PID scores/PID value match that of the constituent particle with
+            the highest primary score
+        - Shower + Track
+          - The track is always merged into the shower, not the other way around
+          - The start point of the shower is updated to be the track end point
+          further away from the current shower start point
+          - The primary scores/primary status match that of the constituent
+            particle with the highest primary score
+          - The PID scores/PID value is kept unchanged (that of the shower)
 
         Parameters
         ----------
         other : RecoParticle
             Other reconstructed particle to merge into this one
         """
-        # Check that both particles being merged are tracks
-        assert self.shape == TRACK_SHP and other.shape == TRACK_SHP, (
-                "Can only merge two track particles.")
+        # Check that the particles being merged fit one of two categories
+        assert (self.shape in (SHOWR_SHP, TRACK_SHP) and
+                other.shape == TRACK_SHP), (
+                "Can only merge two track particles or a track into a shower.")
 
-        # Check that neither particle has yet been matches
+        # Check that neither particle has yet been matched
         assert not self.is_matched and not other.is_matched, (
                 "Cannot merge particles that already have matches.")
 
@@ -279,27 +346,45 @@ class RecoParticle(ParticleBase, RecoBase):
             setattr(self, attr, val)
 
         # Select end points and end directions appropriately
-        points_i = np.vstack([self.start_point, self.end_point])
-        points_j = np.vstack([other.start_point, other.end_point])
-        dirs_i = np.vstack([self.start_dir, self.end_dir])
-        dirs_j = np.vstack([other.start_dir, other.end_dir])
+        if self.shape == TRACK_SHP:
+            # If two tracks, pick points furthest apart
+            points_i = np.vstack([self.start_point, self.end_point])
+            points_j = np.vstack([other.start_point, other.end_point])
+            dirs_i = np.vstack([self.start_dir, self.end_dir])
+            dirs_j = np.vstack([other.start_dir, other.end_dir])
 
-        dists = cdist(points_i, points_j)
-        max_index = np.argmax(dists)
-        max_i, max_j = max_index//2, max_index%2
+            dists = cdist(points_i, points_j)
+            max_index = np.argmax(dists)
+            max_i, max_j = max_index//2, max_index%2
 
-        self.start_point = points_i[max_i]
-        self.end_point = points_j[max_j]
-        self.start_dir = dirs_i[max_i]
-        self.end_dir = dirs_j[max_j]
+            self.start_point = points_i[max_i]
+            self.end_point = points_j[max_j]
+            self.start_dir = dirs_i[max_i]
+            self.end_dir = dirs_j[max_j]
 
-        # If one of the two particles is a primary, the new one is
+        else:
+            # If a shower and a track, pick track point furthest from shower
+            points_i = self.start_point.reshape(-1, 3)
+            points_j = np.vstack([other.start_point, other.end_point])
+            dirs_j = np.vstack([other.start_dir, other.end_dir])
+
+            dists = cdist(points_i, points_j)
+            max_j = np.argmax(dists)
+
+            self.start_point = points_j[max_j]
+            self.start_dir = dirs_j[max_j]
+
+        # Match primary/PID to the most primary particle
         if other.primary_scores[-1] > self.primary_scores[-1]:
             self.primary_scores = other.primary_scores
+            self.is_primary = other.is_primary
+            if self.shape == TRACK_SHP:
+                self.pid_scores = other.pid_scores
+                self.pid = other.pid
 
-        # For PID, pick the most confident prediction (could be better...)
-        if np.max(other.pid_scores) > np.max(self.pid_scores):
-            self.pid_scores = other.pid_scores
+        # If the calorimetric KEs have been computed, can safely sum
+        if other.calo_ke > 0.:
+            self.calo_ke += other.calo_ke
 
     @property
     def mass(self):
@@ -379,12 +464,12 @@ class RecoParticle(ParticleBase, RecoBase):
     def reco_ke(self):
         """Alias for `ke`, to match nomenclature in truth."""
         return self.ke
-    
+
     @property
     def reco_momentum(self):
         """Alias for `momentum`, to match nomenclature in truth."""
         return self.momentum
-    
+
     @property
     def reco_length(self):
         """Alias for `length`, to match nomenclature in truth."""
@@ -394,7 +479,7 @@ class RecoParticle(ParticleBase, RecoBase):
     def reco_start_dir(self):
         """Alias for `start_dir`, to match nomenclature in truth."""
         return self.start_dir
-    
+
     @property
     def reco_end_dir(self):
         """Alias for `end_dir`, to match nomenclature in truth."""
@@ -411,7 +496,13 @@ class TruthParticle(Particle, ParticleBase, TruthBase):
     Attributes
     ----------
     orig_interaction_id : int
-        Unaltered index of the interaction in the original MC paricle list
+        Unaltered index of the interaction in the original MC particle list
+    orig_parent_id : int
+        Unaltered index of the particle parent in the original MC particle list
+    orig_group_id : int
+        Unaltered index of the particle group in the original MC particle list
+    orig_children_id : np.ndarray
+        Unaltered list of the particle children in the original MC particle list
     children_counts : np.ndarray
         (P) Number of truth child particle of each shape
     reco_length : float
@@ -427,6 +518,9 @@ class TruthParticle(Particle, ParticleBase, TruthBase):
         Best-guess reconstructed momentum of the particle
     """
     orig_interaction_id: int = -1
+    orig_parent_id: int = -1
+    orig_group_id: int = -1
+    orig_children_id: np.ndarray = None
     children_counts: np.ndarray = None
     reco_length: float = -1.
     reco_start_dir: np.ndarray = None
@@ -443,7 +537,7 @@ class TruthParticle(Particle, ParticleBase, TruthBase):
 
     # Variable-length attributes
     _var_length_attrs = (
-            ('children_counts', np.int32),
+            ('orig_children_id', np.int64), ('children_counts', np.int32),
             *TruthBase._var_length_attrs,
             *ParticleBase._var_length_attrs,
             *Particle._var_length_attrs

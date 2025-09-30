@@ -68,6 +68,7 @@ SHAPE_LABELS = {
    DELTA_SHP: 'Delta',
    LOWES_SHP: 'LE',
    GHOST_SHP: 'Ghost',
+   UNKWN_SHP: 'Unknown'
 }
 
 # Invalid larcv.Particle labels
@@ -85,7 +86,6 @@ PROT_PID = 4
 KAON_PID = 5
 
 # Mapping between particle PDG code and particle ID labels
-PHOT_PID = 0
 PDG_TO_PID = defaultdict(lambda: -1)
 PDG_TO_PID.update({
     22:   PHOT_PID,

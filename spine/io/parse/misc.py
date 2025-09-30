@@ -4,17 +4,18 @@ Contains the following parsers:
 - :class:`Meta2DParser`
 - :class:`Meta3DParser`
 - :class:`RunInfoParser`
-- :class:`OpFlashParser`
 - :class:`CRTHitParser`
 - :class:`TriggerParser`
 """
 
 
-from spine.data import Meta, RunInfo, Flash, CRTHit, Trigger, ObjectList
+from spine.data import Meta, RunInfo, Flash, CRTHit, Trigger
 
 from spine.utils.conditional import larcv
+from spine.utils.optical import FlashMerger
 
 from .base import ParserBase
+from .data import ParserObjectList
 
 __all__ = ['MetaParser', 'RunInfoParser', 'FlashParser',
            'CRTHitParser', 'TriggerParser']
@@ -42,6 +43,12 @@ class MetaParser(ParserBase):
     # Alternative allowed names of the parser
     aliases = ('meta2d', 'meta3d')
 
+    # Type of object(s) returned by the parser
+    returns = 'object'
+
+    # Overlay strategy for the objects returned by the parser
+    overlay = 'match'
+
     def __call__(self, trees):
         """Parse one entry.
 
@@ -60,7 +67,7 @@ class MetaParser(ParserBase):
         projection_id : int, optional
             Projection ID to get the 2D image from (if fetching from 2D)
         **kwargs : dict, optional
-            Data product arguments to be passed to the `process` function
+            data product arguments to be passed to the `process` function
         """
         # Initialize the parent class
         super().__init__(**kwargs)
@@ -111,6 +118,12 @@ class RunInfoParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'run_info'
+
+    # Type of object(s) returned by the parser
+    returns = 'object'
+
+    # Overlay strategy for the objects returned by the parser
+    overlay = 'cat'
 
     def __call__(self, trees):
         """Parse one entry.
@@ -170,6 +183,27 @@ class FlashParser(ParserBase):
     # Alternative allowed names of the parser
     aliases = ('opflash',)
 
+    # Type of object(s) returned by the parser
+    returns = 'object_list'
+
+    def __init__(self, merge=None, **kwargs):
+        """Initialize the flash parser.
+
+        Parameters
+        ----------
+        merge : dict, optional
+            Flash merging configuration
+        **kwargs : dict, optional
+            data product arguments to be passed to the `process` function
+        """
+        # Initialize the parent class
+        super().__init__(**kwargs)
+
+        # Initialize the flash merging class, if needed
+        self.merger = None
+        if merge is not None:
+            self.merger = FlashMerger(**merge)
+
     def __call__(self, trees):
         """Parse one entry.
 
@@ -222,7 +256,11 @@ class FlashParser(ParserBase):
                     flashes.append(flash)
                     idx += 1
 
-        return ObjectList(flashes, Flash())
+        # If requested, merge flashes which match in time
+        if self.merger is not None:
+            flashes, _ = merger(flashes)
+
+        return ParserObjectList(flashes, Flash())
 
 
 class CRTHitParser(ParserBase):
@@ -237,6 +275,9 @@ class CRTHitParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'crthit'
+
+    # Type of object(s) returned by the parser
+    returns = 'object_list'
 
     def __call__(self, trees):
         """Parse one entry.
@@ -264,7 +305,7 @@ class CRTHitParser(ParserBase):
         crthit_list = crthit_event.as_vector()
         crthits = [CRTHit.from_larcv(larcv.CRTHit(c)) for c in crthit_list]
 
-        return ObjectList(crthits, CRTHit())
+        return ParserObjectList(crthits, CRTHit())
 
 
 class TriggerParser(ParserBase):
@@ -279,6 +320,12 @@ class TriggerParser(ParserBase):
 
     # Name of the parser (as specified in the configuration)
     name = 'trigger'
+
+    # Type of object(s) returned by the parser
+    returns = 'object'
+
+    # Overlay strategy for the objects returned by the parser
+    overlay = 'cat'
 
     def __call__(self, trees):
         """Parse one entry.

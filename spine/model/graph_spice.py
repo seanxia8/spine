@@ -97,7 +97,8 @@ class GraphSPICE(torch.nn.Module):
             If `True`, builds a list of cluster indexes
         """
         # Initialize the embedder
-        self.embedder = GraphSPICEEmbedder(**embedder)
+        self.embedder = GraphSPICEEmbedder(
+                **embedder, use_raw_features=use_raw_features)
 
         # Initialize the kernel function (must be owned here to be loaded)
         self.kernel_fn = kernel_factory(kernel)
@@ -216,6 +217,7 @@ class GraphSPICE(torch.nn.Module):
         else:
             features = result['hypergraph_features']
 
+        coords = TensorBatch(coords.data[:, coords.coord_cols], coords.counts)
         graph = self.constructor(coords, features, seg_label, clust_label)
 
         # If requested, convert edge predictions to node predictions

@@ -152,7 +152,7 @@ class FragmentBuilder(BuilderBase):
         """
         return self._build_truth(**data)
 
-    def _build_truth(self, label_tensor, points_label, depositions_label, 
+    def _build_truth(self, label_tensor, points_label, depositions_label,
                      depositions_q_label=None, label_adapt_tensor=None,
                      points=None, depositions=None, label_g4_tensor=None,
                      points_g4=None, depositions_g4=None, sources_label=None,
@@ -219,11 +219,26 @@ class FragmentBuilder(BuilderBase):
                     part_ids, counts = np.unique(
                             ref_tensor[index_ref, PART_COL], return_counts=True)
                     part_id = int(part_ids[np.argmax(counts)])
+
                 if part_id > -1:
+                    # Load the MC particle information
                     assert part_id < len(particles), (
                             "Invalid particle ID found in fragment labels.")
-                    fragment = TruthFragment(**particles[part_id].as_dict())
+                    particle = particles[part_id]
+                    fragment = TruthFragment(**particle.as_dict())
+
+                    # Override the indexes of the fragment but preserve them
+                    fragment.orig_id = part_id
+                    fragment.orig_group_id = particle.group_id
+                    fragment.orig_parent_id = particle.parent_id
+                    fragment.orig_interaction_id = particle.interaction_id
+                    fragment.orig_children_id = particle.children_id
+
                     fragment.id = i
+                    fragment.group_id = i
+                    fragment.parent_id = i
+                    fragment.children_id = np.empty(
+                            0, dtype=fragment.orig_children_id.dtype)
 
             # Fill long-form attributes
             if truth_only:
@@ -243,7 +258,7 @@ class FragmentBuilder(BuilderBase):
                         index_g4 = np.where(
                                 label_g4_tensor[:, CLUST_COL] == frag_id)[0]
                         fragment.index_g4 = index_g4
-                        fragment.points_g4 = poins_g4[index_g4]
+                        fragment.points_g4 = points_g4[index_g4]
                         fragment.depositions_g4 = depositions_g4[index_g4]
 
             else:
@@ -274,16 +289,17 @@ class FragmentBuilder(BuilderBase):
         """
         return self._load_reco(**data)
 
-    def _load_reco(self, reco_fragments, points, depositions, sources=None):
+    def _load_reco(self, reco_fragments, points=None, depositions=None,
+                   sources=None):
         """Load :class:`RecoFragment` objects from their stored versions.
 
         Parameters
         ----------
         reco_fragments : List[RecoFragment]
             (F) List of partial reconstructed fragments
-        points : np.ndarray
+        points : np.ndarray, optional
             (N, 3) Set of deposition coordinates in the image
-        depositions : np.ndarray
+        depositions : np.ndarray, optional
             (N) Set of deposition values
         sources : np.ndarray, optional
             (N, 2) Tensor which contains the module/tpc information
@@ -300,10 +316,11 @@ class FragmentBuilder(BuilderBase):
                     "The ordering of the stored fragments is wrong.")
 
             # Update the fragment with its long-form attributes
-            fragment.points = points[fragment.index]
-            fragment.depositions = depositions[fragment.index]
-            if sources is not None:
-                fragment.sources = sources[fragment.index]
+            if points is not None:
+                fragment.points = points[fragment.index]
+                fragment.depositions = depositions[fragment.index]
+                if sources is not None:
+                    fragment.sources = sources[fragment.index]
 
         return reco_fragments
 
@@ -322,20 +339,20 @@ class FragmentBuilder(BuilderBase):
         """
         return self._load_truth(**data)
 
-    def _load_truth(self, truth_fragments, points_label, depositions_label,
-                    depositions_q_label=None, points=None, depositions=None,
-                    points_g4=None, depositons_g4=None, sources_label=None,
-                    sources=None):
+    def _load_truth(self, truth_fragments, points_label=None,
+                    depositions_label=None, depositions_q_label=None,
+                    points=None, depositions=None, points_g4=None,
+                    depositions_g4=None, sources_label=None, sources=None):
         """Load :class:`TruthFragment` objects from their stored versions.
 
         Parameters
         ----------
         truth_fragments : List[TruthFragment]
             (F) List of partial truth fragments
-        points_label : np.ndarray
+        points_label : np.ndarray, optional
             (N', 3) Set of deposition coordinates in the label image (identical
             for pixel TPCs, different if deghosting is involved)
-        depositions_label : np.ndarray
+        depositions_label : np.ndarray, optional
             (N') Set of true deposition values in MeV
         depositions_q_label : np.ndarray, optional
             (N') Set of true deposition values in ADC, if relevant
@@ -364,12 +381,13 @@ class FragmentBuilder(BuilderBase):
                     "The ordering of the stored fragments is wrong.")
 
             # Update the fragment with its long-form attributes
-            fragment.points = points_label[fragment.index]
-            fragment.depositions = depositions_label[fragment.index]
-            if depositions_q_label is not None:
-                fragment.depositions_q = depositions_q_label[fragment.index]
-            if sources_label is not None:
-                fragment.sources = sources_label[fragment.index]
+            if points_label is not None:
+                fragment.points = points_label[fragment.index]
+                fragment.depositions = depositions_label[fragment.index]
+                if depositions_q_label is not None:
+                    fragment.depositions_q = depositions_q_label[fragment.index]
+                if sources_label is not None:
+                    fragment.sources = sources_label[fragment.index]
 
             if points is not None:
                 fragment.points_adapt = points[fragment.index_adapt]

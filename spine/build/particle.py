@@ -5,7 +5,9 @@ import numpy as np
 from scipy.special import softmax
 
 from spine.data.out import RecoParticle, TruthParticle
+
 from spine.utils.globals import COORD_COLS, VALUE_COL, GROUP_COL, TRACK_SHP
+from spine.utils.gnn.network import filter_invalid_nodes
 
 from .base import BuilderBase
 
@@ -39,19 +41,20 @@ class ParticleBuilder(BuilderBase):
 
     # Necessary/optional data products to build a truth object
     _build_truth_keys = (
-            ('particles', False), ('truth_fragments', False),
+            ('particles', False), ('graph_label', False),
+            ('truth_fragments', False),
             *BuilderBase._build_truth_keys
     )
 
     # Necessary/optional data products to load a reconstructed object
     _load_reco_keys  = (
-            ('reco_particles', True),
+            ('reco_particles', True), ('reco_fragments', False),
             *BuilderBase._load_reco_keys
     )
 
     # Necessary/optional data products to load a truth object
     _load_truth_keys  = (
-            ('truth_particles', True),
+            ('truth_particles', True), ('truth_fragments', False),
             *BuilderBase._load_truth_keys
     )
 
@@ -112,6 +115,11 @@ class ParticleBuilder(BuilderBase):
         if particle_node_orient_pred is not None:
             orient_pred = np.argmax(particle_node_orient_pred, axis=1)
 
+        # Prepare fragment associations, if they were built
+        if reco_fragments is not None:
+            particle_ids = [frag.particle_id for frag in reco_fragments]
+            particle_ids = np.unique(particle_ids, return_inverse=True)[-1]
+
         # Loop over the particle instances
         reco_particles = []
         for i, index in enumerate(particle_clusts):
@@ -146,6 +154,15 @@ class ParticleBuilder(BuilderBase):
             if sources is not None:
                 particle.sources = sources[index]
 
+            # Build fragment associations, if available
+            if reco_fragments is not None:
+                fragment_ids = np.where(particle_ids == i)[0]
+                particle.fragments = [reco_fragments[j] for j in fragment_ids]
+                particle.fragment_ids = fragment_ids
+                for frag in particle.fragments:
+                    frag.particle_id = i
+                    frag.interaction_id = particle.interaction_id
+
             # Append
             reco_particles.append(particle)
 
@@ -165,7 +182,8 @@ class ParticleBuilder(BuilderBase):
                      depositions_label, depositions_q_label=None,
                      label_adapt_tensor=None, points=None, depositions=None,
                      label_g4_tensor=None, points_g4=None, depositions_g4=None,
-                     sources_label=None, sources=None, truth_fragments=None):
+                     sources_label=None, sources=None, graph_label=None,
+                     truth_fragments=None):
         """Builds :class:`TruthParticle` objects from the full chain output.
 
         Parameters
@@ -199,6 +217,8 @@ class ParticleBuilder(BuilderBase):
             (N', 2) Tensor which contains the label module/tpc information
         sources : np.ndarray, optional
             (N, 2) Tensor which contains the module/tpc information
+        graph_label : np.ndarray, optional
+            (E, 2) Parentage relations in the set of particles
         truth_fragments : List[TruthFragment], optional
             (F) List of true fragments
 
@@ -209,6 +229,11 @@ class ParticleBuilder(BuilderBase):
         """
         # Fetch the group ID of each of the particles
         group_ids = np.array([p.group_id for p in particles], dtype=int)
+
+        # Prepare fragment associations, if they were built
+        if truth_fragments is not None:
+            fragment_group_ids = np.array(
+                    [frag.orig_group_id for frag in truth_fragments])
 
         # Loop over the true *visible* particle instance groups
         truth_particles = []
@@ -222,9 +247,18 @@ class ParticleBuilder(BuilderBase):
             assert particle.id == group_id, (
                     "The ordering of the true particles is wrong.")
 
-            # Override the index of the particle but preserve it
+            # Override the index of the particle and its group, but preserve it
             particle.orig_id = group_id
+            particle.orig_group_id = group_id
+            particle.orig_parent_id = particle.parent_id
+            particle.orig_interaction_id = particle.interaction_id
+            particle.orig_children_id = particle.children_id
+
             particle.id = i
+            particle.group_id = i
+            particle.parent_id = i
+            particle.children_id = np.empty(
+                    0, dtype=particle.orig_children_id.dtype)
 
             # Update the deposited energy attribute by summing that of all
             # particles in the group (LArCV definition != SPINE definition)
@@ -265,8 +299,33 @@ class ParticleBuilder(BuilderBase):
                 particle.points_g4 = points_g4[index_g4]
                 particle.depositions_g4 = depositions_g4[index_g4]
 
+            # Build fragment associations, if available
+            if truth_fragments is not None:
+                fragment_ids = np.where(fragment_group_ids == group_id)[0]
+                particle.fragments = [truth_fragments[j] for j in fragment_ids]
+                particle.fragment_ids = fragment_ids
+                for frag in particle.fragments:
+                    frag.particle_id = i
+
             # Append
             truth_particles.append(particle)
+
+        # If the parentage relations of non-empty particles are available,
+        # use them to assign parent/children IDs in the new particle set
+        if graph_label is not None:
+            # Narrow down the list of edges to those connecting visible particles
+            inval = set(np.unique(graph_label)).difference(set(valid_group_ids))
+            if len(inval) > 0:
+                graph_label = filter_invalid_nodes(graph_label, tuple(inval))
+
+            # Use the remaining edges to build parentage relations
+            mapping = {group_id: i for i, group_id in enumerate(valid_group_ids)}
+            for (source, target) in graph_label:
+                parent = truth_particles[mapping[source]]
+                child = truth_particles[mapping[target]]
+
+                child.parent_id = parent.id
+                parent.children_id = np.append(parent.children_id, child.id)
 
         return truth_particles
 
@@ -280,19 +339,22 @@ class ParticleBuilder(BuilderBase):
         """
         return self._load_reco(**data)
 
-    def _load_reco(self, reco_particles, points, depositions, sources=None):
+    def _load_reco(self, reco_particles, points=None, depositions=None,
+                   sources=None, reco_fragments=None):
         """Construct :class:`RecoParticle` objects from their stored versions.
 
         Parameters
         ----------
         reco_particles : List[RecoParticle]
             (P) List of partial reconstructed particles
-        points : np.ndarray
+        points : np.ndarray, optional
             (N, 3) Set of deposition coordinates in the image
-        depositions : np.ndarray
+        depositions : np.ndarray, optional
             (N) Set of deposition values
         sources : np.ndarray, optional
             (N, 2) Tensor which contains the module/tpc information
+        reco_fragments : List[RecoFragment], optional
+            (F) List of reconstructed fragments
 
         Returns
         -------
@@ -306,10 +368,16 @@ class ParticleBuilder(BuilderBase):
                     "The ordering of the stored particles is wrong.")
 
             # Update the particle with its long-form attributes
-            particle.points = points[particle.index]
-            particle.depositions = depositions[particle.index]
-            if sources is not None:
-                particle.sources = sources[particle.index]
+            if points is not None:
+                particle.points = points[particle.index]
+                particle.depositions = depositions[particle.index]
+                if sources is not None:
+                    particle.sources = sources[particle.index]
+
+            # Load the fragment associations, if available
+            if reco_fragments is not None:
+                particle.fragments = [
+                        reco_fragments[j] for j in particle.fragment_ids]
 
         return reco_particles
 
@@ -323,20 +391,21 @@ class ParticleBuilder(BuilderBase):
         """
         return self._load_truth(**data)
 
-    def _load_truth(self, truth_particles, points_label, depositions_label,
-                    depositions_q_label=None, points=None, depositions=None,
-                    points_g4=None, depositions_g4=None, sources_label=None,
-                    sources=None):
+    def _load_truth(self, truth_particles, points_label=None,
+                    depositions_label=None, depositions_q_label=None,
+                    points=None, depositions=None, points_g4=None,
+                    depositions_g4=None, sources_label=None, sources=None,
+                    truth_fragments=None):
         """Construct :class:`TruthParticle` objects from their stored versions.
 
         Parameters
         ----------
         truth_particles : List[TruthParticle]
             (P) List of partial truth particles
-        points_label : np.ndarray
+        points_label : np.ndarray, optional
             (N', 3) Set of deposition coordinates in the label image (identical
             for pixel TPCs, different if deghosting is involved)
-        depositions_label : np.ndarray
+        depositions_label : np.ndarray, optional
             (N') Set of true deposition values in MeV
         depositions_q_label : np.ndarray, optional
             (N') Set of true deposition values in ADC, if relevant
@@ -352,6 +421,8 @@ class ParticleBuilder(BuilderBase):
             (N', 2) Tensor which contains the label module/tpc information
         sources : np.ndarray, optional
             (N, 2) Tensor which contains the module/tpc information
+        truth_fragments : List[TruthFragment], optional
+            (F) List of true fragments
 
         Returns
         -------
@@ -365,12 +436,13 @@ class ParticleBuilder(BuilderBase):
                     "The ordering of the stored particles is wrong.")
 
             # Update the particle with its long-form attributes
-            particle.points = points_label[particle.index]
-            particle.depositions = depositions_label[particle.index]
-            if depositions_q_label is not None:
-                particle.depositions_q = depositions_q_label[particle.index]
-            if sources_label is not None:
-                particle.sources = sources_label[particle.index]
+            if points_label is not None:
+                particle.points = points_label[particle.index]
+                particle.depositions = depositions_label[particle.index]
+                if depositions_q_label is not None:
+                    particle.depositions_q = depositions_q_label[particle.index]
+                if sources_label is not None:
+                    particle.sources = sources_label[particle.index]
 
             if points is not None:
                 particle.points_adapt = points[particle.index_adapt]
@@ -381,5 +453,10 @@ class ParticleBuilder(BuilderBase):
             if points_g4 is not None:
                 particle.points_g4 = points_g4[particle.index_g4]
                 particle.depositions_g4 = depositions_g4[particle.index_g4]
+
+            # Load the fragment associations, if available
+            if truth_fragments is not None:
+                particle.fragments = [
+                        truth_fragments[j] for j in particle.fragment_ids]
 
         return truth_particles

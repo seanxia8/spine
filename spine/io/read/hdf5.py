@@ -1,11 +1,13 @@
 """Contains a reader class dedicated to loading data from HDF5 files."""
 
 import h5py
+import yaml
 import numpy as np
 from dataclasses import fields
 
 import spine.data
 
+from spine.utils.logger import logger
 from spine.utils.decorators import inherit_docstring
 
 from .base import ReaderBase
@@ -101,7 +103,7 @@ class HDF5Reader(ReaderBase):
                 self.num_entries += num_entries
 
         # Dump the number of entries to load
-        print(f"Total number of entries in the file(s): {self.num_entries}\n")
+        logger.info("Total number of entries in the file(s): %d\n", self.num_entries)
 
         # Concatenate the file indexes into one
         self.file_index = np.concatenate(self.file_index)
@@ -122,6 +124,46 @@ class HDF5Reader(ReaderBase):
         self.build_classes = build_classes
         self.skip_unknown_attrs = skip_unknown_attrs
 
+        # Process the configuration used to produce the HDF5 file
+        self.cfg = self.process_cfg()
+
+        # Process the SPINE version used to produced the HDF5 file
+        self.version = self.process_version()
+
+    def process_cfg(self):
+        """Fetches the SPINE configuration used to produce the HDF5 file.
+
+        Returns
+        -------
+        dict
+            Configuration dictionary
+        """
+        # Fetch the string-form configuration
+        with h5py.File(self.file_paths[0], 'r') as in_file:
+            cfg_str = in_file['info'].attrs['cfg']
+
+        # Attempt to parse it (need try for now for SPINE versions < v0.4.0)
+        try:
+            cfg = yaml.safe_load(cfg_str)
+        except:
+            return None
+
+        return cfg
+
+    def process_version(self):
+        """Returns the SPINE release version used to produce the HDF5 file.
+
+        Returns
+        -------
+        str
+            SPINE release tag
+        """
+        # Fetch the string-form configuration
+        with h5py.File(self.file_paths[0], 'r') as in_file:
+            version = in_file['info'].attrs['version']
+
+        return version
+
     def get(self, idx):
         """Returns a specific entry in the file.
 
@@ -141,11 +183,14 @@ class HDF5Reader(ReaderBase):
         entry_idx = self.get_file_entry_index(idx)
 
         # Use the event tree to find out what needs to be loaded
-        data = {'file_index': file_idx}
+        data = {'file_index': file_idx, 'file_entry_index': entry_idx}
         with h5py.File(self.file_paths[file_idx], 'r') as in_file:
             event = in_file['events'][entry_idx]
             for key in event.dtype.names:
                 self.load_key(in_file, event, data, key)
+
+        # Use the global index, not the one read from file
+        data['index'] = np.int64(idx)
 
         return data
 

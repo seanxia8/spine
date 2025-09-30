@@ -10,9 +10,12 @@ from spine.utils.globals import COORD_COLS, PID_LABELS, SHAPE_LABELS, TRACK_SHP
 
 from .geo import GeoDrawer
 from .point import scatter_points
+from .arrow import scatter_arrows
 from .cluster import scatter_clusters
 from .layout import (
         layout3d, dual_figure3d, PLOTLY_COLORS_WGRAY, HIGH_CONTRAST_COLORS)
+
+__all__ = ['Drawer']
 
 
 class Drawer:
@@ -43,9 +46,15 @@ class Drawer:
             ('depositions_g4', 'depositions_g4')
     )
 
+    # List of known source modes for true particles and their corresponding keys
+    _source_modes = (
+            ('sources', 'sources_label'),
+            ('sources_adapt', 'sources')
+    )
+
     def __init__(self, data, draw_mode='both', truth_point_mode='points',
-                 split_scene=True, detector=None, detector_coords=True,
-                 **kwargs):
+                 split_scene=True, detector=None, show_crt=False,
+                 detector_coords=True, **kwargs):
         """Initialize the drawer attributes
 
         Parameters
@@ -96,19 +105,21 @@ class Drawer:
         self.truth_point_key = self.point_modes[self.truth_point_mode]
         self.truth_index_mode = truth_point_mode.replace('points', 'index')
 
-        # If detector information is provided, initialie the geometry drawer
-        self.geo_drawer = None
+        # If detector information is provided, initialize the geometry drawer
+        self.geo, self.geo_drawer = None, None
         self.meta = data.get('meta', None)
         if detector is not None:
             self.geo_drawer = GeoDrawer(
                     detector=detector, detector_coords=detector_coords)
+            self.geo = self.geo_drawer.geo
 
         # Initialize the layout
+        self.show_crt = show_crt
         self.split_scene = split_scene
         meta = self.meta if detector is None else None
         self.layout = layout3d(
                 detector=detector, meta=meta, detector_coords=detector_coords,
-                **kwargs)
+                show_crt=show_crt, **kwargs)
 
     @property
     def point_modes(self):
@@ -134,6 +145,18 @@ class Drawer:
         """
         return dict(self._dep_modes)
 
+    @property
+    def source_modes(self):
+        """Dictionary which makes the correspondance between the name of a true
+        object source attribute with the underlying source array it points to.
+
+        Returns
+        -------
+        Dict[str, str]
+            Dictionary of (attribute, key) mapping for point source
+        """
+        return dict(self._source_modes)
+
     def get_index(self, obj):
         """Get a certain pre-defined index attribute of an object.
 
@@ -157,9 +180,10 @@ class Drawer:
             return getattr(obj, self.truth_index_mode)
 
     def get(self, obj_type, attr=None, color_attr=None, draw_raw=False,
-            draw_end_points=False, draw_vertices=False, draw_flashes=False,
-            synchronize=False, titles=None, split_traces=False,
-            matched_flash_only=True):
+            draw_end_points=False, draw_directions=False, draw_vertices=False,
+            draw_flashes=False, matched_flash_only=True, draw_crthits=False,
+            matched_crthit_only=True, synchronize=False, titles=None,
+            split_traces=False):
         """Draw the requested object type with the requested mode.
 
         Parameters
@@ -175,18 +199,24 @@ class Drawer:
             If `True`, add a trace which corresponds to the raw depositions
         draw_end_points : bool, default False
             If `True`, draw the fragment or particle end points
+        draw_directions : bool, default False
+            If `True`, draw the fragment or particle start directions
         draw_vertices : bool, default False
             If `True`, draw the interaction vertices
         draw_flashes : bool, default False
-            If `True`, draw flashes that have been matched to interactions
+            If `True`, draw the flashes
+        matched_flash_only : bool, default True
+            If `True`, only flashes matched to interactions are drawn
+        draw_crthits : bool, default False
+            If `True`, draw the CRT hits
+        matched_crthit_only : bool, default True
+            If `True`, only CRT hits matched to interactions are drawn
         synchronize : bool, default False
             If `True`, matches the camera position/angle of one plot to the other
         titles : List[str], optional
-            Titles of the two scenes (only relevant for split_scene True
+            Titles of the two scenes (only relevant for split_scene=True)
         split_traces : bool, default False
             If `True`, one trace is produced for each object
-        matched_flash_only : bool, default True
-            If `True`, only flashes matched to interactions are drawn
 
         Returns
         -------
@@ -219,8 +249,16 @@ class Drawer:
                     "Interactions do not have end point attributes.")
             for prefix in self.prefixes:
                 obj_name = f'{prefix}_{obj_type}'
-                traces[prefix] += self._start_point_trace(obj_name)
-                traces[prefix] += self._end_point_trace(obj_name)
+                traces[prefix] += self._start_point_trace(obj_name, split_traces)
+                traces[prefix] += self._end_point_trace(obj_name, split_traces)
+
+        # Fetch the directions, if requested
+        if draw_directions:
+            assert obj_name != 'interactions', (
+                    "Interactions do not have direction attributes.")
+            for prefix in self.prefixes:
+                obj_name = f'{prefix}_{obj_type}'
+                traces[prefix] += self._direction_trace(obj_name, split_traces)
 
         # Fetch the vertices, if requested
         if draw_vertices:
@@ -228,7 +266,7 @@ class Drawer:
                 obj_name = f'{prefix}_interactions'
                 assert obj_name in self.data, (
                         "Must provide interactions to draw their vertices.")
-                traces[prefix] += self._vertex_trace(obj_name)
+                traces[prefix] += self._vertex_trace(obj_name, split_traces)
 
         # Fetch the flashes, if requested
         if draw_flashes:
@@ -239,6 +277,14 @@ class Drawer:
                 assert obj_name in self.data, (
                         "Must provide interactions to draw matched flashes.")
                 traces[prefix] += self._flash_trace(obj_name, matched_flash_only)
+
+        # Fetch the CRT hits, if requested
+        if draw_crthits:
+            assert 'crthits' in self.data, (
+                    "Must provide the `crthits` objects to draw them.")
+            for prefix in self.prefixes:
+                obj_name = f'{prefix}_{obj_type}'
+                traces[prefix] += self._crt_trace(obj_name, matched_crthit_only)
 
         # Add the TPC traces, if available
         if self.geo_drawer is not None:
@@ -351,35 +397,56 @@ class Drawer:
             single_attr = isinstance(attr, str)
             attrs = [attr] if single_attr else attr
             for attr in attrs:
-                # If it is a true deposition attribute, check that it matches
+                # If it is a true deposition/source attribute, check that it matches
                 # the point mode that is being used to draw the true objects
-                if 'truth' in obj_name and attr.startswith('depositions'):
-                    prefix = self.truth_point_mode.replace('points', 'depositions')
-                    assert attr.startswith(prefix), (
-                            f"Points mode {self.truth_point_mode} and deposition "
-                            f"mode {attr} are incompatible.")
+                if 'truth' in obj_name:
+                    if self._is_depositions(attr):
+                        prefix = self.truth_point_mode.replace('points', 'depositions')
+                        assert attr.startswith(prefix), (
+                                f"Points mode {self.truth_point_mode} and deposition "
+                                f"mode {attr} are incompatible.")
+                    if self._is_sources(attr):
+                        ref_name = self.truth_point_mode.replace('points', 'sources')
+                        assert attr == ref_name, (
+                                f"Points mode {self.truth_point_mode} and source "
+                                f"mode {attr} are incompatible.")
 
                 # Get the value, color and hovertext
                 attr_name = ' '.join(attr.split('_')).capitalize()
                 values = [getattr(obj, attr) for obj in self.data[obj_name]]
                 if single_attr or attr == color_attr:
-                    color = values
-                if not attr.startswith('depositions'):
+                    if not self._is_sources(attr):
+                        color = values
+                    else:
+                        assert self.geo is not None, (
+                                "Provide detector name/geometry if the TPC "
+                                "sources are to be displayed.")
+                        color = [self.geo.get_chambers(v) for v in values]
+
+                if self._is_depositions(attr):
+                    tostr = lambda v: f'<br>Deposition: {v:0.3f}'
                     for i, hc in enumerate(hovertext):
                         if isinstance(hc, str):
-                            hovertext[i] = hc + f'<br>{attr_name}: {values[i]}'
+                            hovertext[i] = [hc + tostr(v) for v in values[i]]
                         else:
-                            hovertext[i] = [
-                                    hcj + f'<br>{attr_name}: {values[i]}' for hcj in hc]
+                            hovertext[i] = [hc[i] + tostr(v) for i, v in enumerate(values[i])]
+
+                elif self._is_sources(attr):
+                    tostr = lambda v: f'<br>Module, TPC: {v[0]:d}, {v[1]:d}'
+                    values = [self.geo.get_sources(v) for v in values]
+                    for i, hc in enumerate(hovertext):
+                        if isinstance(hc, str):
+                            hovertext[i] = [hc + tostr(v) for v in values[i]]
+                        else:
+                            hovertext[i] = [hc[i] + tostr(v) for i, v in enumerate(values[i])]
 
                 else:
+                    tostr = lambda v: f'<br>{attr_name}: {v}'
                     for i, hc in enumerate(hovertext):
                         if isinstance(hc, str):
-                            hovertext[i] = [
-                                    hc + f'<br>Value: {v:0.3f}' for v in values[i]]
+                            hovertext[i] = hc + tostr(values[i])
                         else:
-                            hovertext[i] = [
-                                    hc[i] + f'<br>Value: {v:0.3f}' for i, v in enumerate(values[i])]
+                            hovertext[i] = [hcj + tostr(values[i]) for hcj in hc]
 
             # Determine which attribute to define the colorscale
             if color_attr is None:
@@ -388,14 +455,31 @@ class Drawer:
                 else:
                     color_attr = 'id'
                     color = np.arange(len(self.data[obj_name]))
-                
+
         # Set up the appropriate color scheme
-        if color_attr.startswith('depositions'):
+        if self._is_depositions(color_attr):
             # Continuous values shared between objects
             dep_mode = self.dep_modes[color_attr] if 'truth' in obj_name else 'depositions'
             colorscale = 'Inferno'
             cmin = 0.
             cmax = 2*np.median(self.data[dep_mode])
+
+        elif self._is_sources(color_attr):
+            # Variable-length descrete values
+            count = self.geo.tpc.num_chambers
+            colorscale = HIGH_CONTRAST_COLORS
+            if count == 0:
+                colorscale = None
+            elif count == 1:
+                colorscale = [colorscale[0]] * 2 # Avoid length 0 colorscale
+            elif count <= len(colorscale):
+                colorscale = colorscale[:count]
+            else:
+                repeat = (count - 1)//len(colorscale) + 1
+                colorscale = np.tile(colorscale, repeat)[:count]
+
+            cmin = 0
+            cmax = count - 1
 
         elif color_attr.startswith('is_'):
             # Boolean
@@ -414,9 +498,9 @@ class Drawer:
 
         elif color_attr.endswith('id'):
             # Variable-lengh discrete values
-            color = np.unique(color, return_inverse=True)[-1]
+            unique, color = np.unique(color, return_inverse=True)
             colorscale = HIGH_CONTRAST_COLORS
-            count = len(color)
+            count = len(unique)
             if count == 0:
                 colorscale = None
             elif count == 1:
@@ -425,10 +509,10 @@ class Drawer:
                 colorscale = colorscale[:count]
             else:
                 repeat = (count - 1)//len(colorscale) + 1
-                self._colorscale = np.repeat(colorscale, repeat)[:count]
+                colorscale = np.tile(colorscale, repeat)[:count]
 
             cmin = 0
-            cmax = count# - 1
+            cmax = count - 1
 
         else:
             raise ValueError(
@@ -457,17 +541,19 @@ class Drawer:
                 points, color=deps, cmin=cmin, cmax=cmax, colorscale='Inferno',
                 name='Raw input')
 
-    def _start_point_trace(self, obj_name, color='black', markersize=7,
-                            marker_symbol='circle', **kwargs):
+    def _start_point_trace(self, obj_name, split_traces, color='black', markersize=7,
+                           marker_symbol='circle', **kwargs):
         """Scatters the start points of the requested object type.
 
         Parameters
         ----------
         obj_name : str
             Name of the object to draw
-        color : Union[str, np.ndarray], optional
+        split_traces : bool
+            If `True`, one trace is produced for each object
+        color : Union[str, np.ndarray], default 'black'
             Color of markers/lines or (N) list of color of markers/lines
-        markersize : float, default 5
+        markersize : float, default 7
             Marker size
         marker_symbol : float, default 'circle'
             Marker style
@@ -480,10 +566,10 @@ class Drawer:
             List of start point traces
         """
         return self._point_trace(
-                obj_name, 'start_point', color=color, markersize=markersize,
-                marker_symbol=marker_symbol, **kwargs)
+                obj_name, 'start_point', split_traces, color=color,
+                markersize=markersize, marker_symbol=marker_symbol, **kwargs)
 
-    def _end_point_trace(self, obj_name, color='black', markersize=7,
+    def _end_point_trace(self, obj_name, split_traces, color='black', markersize=7,
                           marker_symbol='circle-open', **kwargs):
         """Scatters the end points of the requested object type.
 
@@ -491,9 +577,11 @@ class Drawer:
         ----------
         obj_name : str
             Name of the object to draw
-        color : Union[str, np.ndarray], optional
+        split_traces : bool
+            If `True`, one trace is produced for each object
+        color : Union[str, np.ndarray], default 'black'
             Color of markers/lines or (N) list of color of markers/lines
-        markersize : float, default 5
+        markersize : float, default 7
             Marker size
         marker_symbol : float, default 'circle-open'
             Marker style
@@ -506,10 +594,10 @@ class Drawer:
             List of end point traces
         """
         return self._point_trace(
-                obj_name, 'end_point', color=color, markersize=markersize,
-                marker_symbol=marker_symbol, **kwargs)
+                obj_name, 'end_point', split_traces, color=color,
+                markersize=markersize, marker_symbol=marker_symbol, **kwargs)
 
-    def _vertex_trace(self, obj_name, vertex_attr='vertex', color='green',
+    def _vertex_trace(self, obj_name, split_traces, vertex_attr='vertex', color='green',
                       markersize=10, marker_symbol='diamond', **kwargs):
         """Scatters the vertex of the requested object type.
 
@@ -517,7 +605,9 @@ class Drawer:
         ----------
         obj_name : str
             Name of the object to draw
-        color : Union[str, np.ndarray], optional
+        split_traces : bool
+            If `True`, one trace is produced for each object
+        color : Union[str, np.ndarray], default 'green'
             Color of markers/lines or (N) list of color of markers/lines
         markersize : float, default 10
             Marker size
@@ -532,10 +622,10 @@ class Drawer:
             List of vertex point traces
         """
         return self._point_trace(
-                obj_name, vertex_attr, color=color, markersize=markersize,
-                marker_symbol=marker_symbol, **kwargs)
+                obj_name, vertex_attr, split_traces, color=color,
+                markersize=markersize, marker_symbol=marker_symbol, **kwargs)
 
-    def _point_trace(self, obj_name, point_attr, **kwargs):
+    def _point_trace(self, obj_name, point_attr, split_traces, **kwargs):
         """Scatters a set of discrete points per object instance.
 
         Parameters
@@ -544,6 +634,8 @@ class Drawer:
             Name of the object to draw
         point_attr : str
             Name of the attribute specifying end point to draw
+        split_traces : bool
+            If `True`, one trace is produced for each object
         **kwargs : dict, optional
             List of additional arguments to pass to :func:`scatter_points`
 
@@ -558,7 +650,7 @@ class Drawer:
 
         # Fetch the particular end point of each object
         obj_type = obj_name.split('_')[-1][:-1].capitalize()
-        point_list, hovertext = [], []
+        point_list, hovertext, idxs = [], [], []
         for i, obj in enumerate(self.data[obj_name]):
             # If it is an end point, skip if the object is not a track
             if point_attr == 'end_point' and obj.shape != TRACK_SHP:
@@ -571,17 +663,82 @@ class Drawer:
             # Append the particular end point of this object and the label
             point_list.append(getattr(obj, point_attr))
             hovertext.append(f'{obj_type} {i} ' + ' '.join(point_attr.split('_')))
+            idxs.append(i)
 
         points = np.empty((0, 3))
         if len(point_list):
             points = np.vstack(point_list)
 
-        return scatter_points(
-                points, hovertext=np.array(hovertext), name=name, **kwargs)
+        if not split_traces:
+            traces = scatter_points(
+                    points, hovertext=np.array(hovertext), name=name, **kwargs)
+
+        else:
+            traces = []
+            for i, point in enumerate(point_list):
+                traces += scatter_points(
+                        point[None, :], hovertext=hovertext[i],
+                        name=f'{name} {idxs[i]}', **kwargs)
+
+        return traces
+
+    def _direction_trace(self, obj_name, split_traces, color='black', **kwargs):
+        """Scatters a set of discrete points per object instance.
+
+        Parameters
+        ----------
+        obj_name : str
+            Name of the object to draw
+        split_traces : bool
+            If `True`, one trace is produced for each object
+        color : Union[str, np.ndarray], default 'black'
+            Color of markers/lines or (N) list of color of markers/lines
+        **kwargs : dict, optional
+            List of additional arguments to pass to :func:`scatter_arrows`
+
+        Returns
+        -------
+        list
+            List of point traces
+        """
+        # Define the name of the trace
+        name = ' '.join(obj_name.split('_')).capitalize()[:-1] + ' directions'
+
+        # Fetch the direction of each object
+        obj_type = obj_name.split('_')[-1][:-1].capitalize()
+        point_list, dir_list, hovertext, idxs = [], [], [], []
+        for i, obj in enumerate(self.data[obj_name]):
+            # Skip empty true objects
+            if obj.is_truth and not len(getattr(obj, self.truth_index_mode)):
+                continue
+
+            # Append the direction of this object and the label
+            point_list.append(obj.start_point)
+            dir_list.append(obj.start_dir)
+            hovertext.append(f'{obj_type} {i} direction')
+            idxs.append(i)
+
+        points, dirs = np.empty((0, 3)), np.empty((0, 3))
+        if len(point_list):
+            points = np.vstack(point_list)
+            dirs = np.vstack(dir_list)
+
+        if not split_traces:
+            traces = scatter_arrows(
+                    points, dirs, hovertext=np.array(hovertext), name=name,
+                    color=color, **kwargs)
+
+        else:
+            traces = []
+            for i, (point, start_dir) in enumerate(zip(point_list, dir_list)):
+                traces += scatter_arrows(
+                        point[None, :], start_dir[None, :], color=color,
+                        hovertext=hovertext[i], name=f'{name} {idxs[i]}', **kwargs)
+
+        return traces
 
     def _flash_trace(self, obj_name, matched_only, **kwargs):
-        """Draw the cumlative PEs of flashes that have been matched to
-        interactions specified by `obj_name`.
+        """Draw the cumulative PEs of flashes.
 
         Parameters
         ----------
@@ -601,6 +758,10 @@ class Drawer:
         assert self.geo_drawer is not None, (
                 "Cannot draw optical detectors without geometry information.")
 
+        # Check that there are optical detectors to draw
+        assert self.geo.optical is not None, (
+                "This geometry does not have optical detectors to draw.")
+
         # Define the name of the trace
         name = ' '.join(obj_name.split('_')).capitalize()[:-1] + ' flashes'
 
@@ -614,11 +775,11 @@ class Drawer:
             flash_ids = np.arange(len(self.data['flashes']))
 
         # Sum values from each flash to build a a global color scale
-        color = np.zeros(self.geo_drawer.geo.optical.num_detectors)
-        opt_det_ids = self.geo_drawer.geo.optical.det_ids
+        color = np.zeros(self.geo.optical.num_detectors)
+        opt_det_ids = self.geo.optical.det_ids
         for flash_id in flash_ids:
             flash = self.data['flashes'][flash_id]
-            index = self.geo_drawer.geo.optical.volume_index(flash.volume_id)
+            index = self.geo.optical.volume_index(flash.volume_id)
             pe_per_ch = flash.pe_per_ch
             if opt_det_ids is not None:
                 pe_per_ch = np.bincount(opt_det_ids, weights=pe_per_ch)
@@ -628,3 +789,101 @@ class Drawer:
         return self.geo_drawer.optical_traces(
                 meta=self.meta, color=color, zero_supress=True,
                 colorscale='Inferno', name=name)
+
+    def _crt_trace(self, obj_name, matched_only, **kwargs):
+        """Draw the CRT planes and the hits.
+
+        Parameters
+        ----------
+        obj_name : str
+            Name of the object to draw
+        matched_only : bool
+            If `True`, only CRT hits matched to interactions are drawn
+        **kwargs : dict, optional
+            List of additional arguments to pass to :func:`optical_traces`
+
+        Returns
+        -------
+        list
+            List of optical detector traces
+        """
+        # If there was no geometry provided by the user, nothing to do here
+        assert self.geo_drawer is not None, (
+                "Cannot draw CRT detectors without geometry information.")
+
+        # Check that there are CRT planes to draw
+        assert self.geo.crt is not None, (
+                "This geometry does not have CRT planes to draw.")
+
+        # Define the names of the traces
+        name_pl = ' '.join(obj_name.split('_')).capitalize()[:-1] + ' CRT planes'
+        name_hits = ' '.join(obj_name.split('_')).capitalize()[:-1] + ' CRT hits'
+
+        # Fetch CRT hits. Restrict to matched hits, if requested
+        crthits = self.data['crthits']
+        if matched_only:
+            crt_ids = []
+            for inter in self.data[obj_name]:
+                if inter.is_crt_matched:
+                    crt_ids.extend(inter.crt_ids)
+            crt_ids = np.unique(crt_ids)
+            crthits = [crthits[idx] for idx in crt_ids]
+
+        # Identify which of the CRT planes were hit (to know what to draw)
+        det_ids = [self.geo.crt.det_ids[hit.plane] for hit in crthits]
+        unique_det_ids = np.unique(det_ids)
+
+        # Initialize the hovertext for the planes and hits
+        hovertext_pl, hovertext_hits = [], []
+        for i, det_id in enumerate(unique_det_ids):
+            hovertext_pl.append(f'CRT Plane {det_id}')
+        for i, hit in enumerate(crthits):
+            hovertext_hits.append(f'CRT hit {hit.id}<br>CRT Plane ID: {det_ids[i]}')
+
+        # Initialize the CRT plane traces
+        traces = self.geo_drawer.crt_traces(
+                meta=self.meta, draw_ids=unique_det_ids,
+                hovertext=hovertext_pl, name=name_pl)
+
+        # Build a scatter plot of CRT hits
+        points = np.empty((0, 3))
+        if len(crthits) > 0:
+            points = np.vstack([hit.center for hit in crthits])
+
+        traces += scatter_points(
+                points, color='gray', markersize=5,
+                hovertext=hovertext_hits, name=name_hits, **kwargs)
+
+        return traces
+
+    @staticmethod
+    def _is_depositions(attr):
+        """Check if an attribute represents one deposition value per point.
+
+        Parameters
+        ----------
+        attr : str
+            Object attribute to check
+
+        Returns
+        -------
+        bool
+            `True` is the attribute is a deposition attribute
+        """
+        return attr.startswith('depositions') and not attr.endswith('sum')
+
+    @staticmethod
+    def _is_sources(attr):
+        """Check if an attribute represents one source value per point.
+
+        Parameters
+        ----------
+        attr : str
+            Object attribute to check
+
+        Returns
+        -------
+        bool
+            `True` is the attribute is a source attribute
+        """
+        return attr.startswith('sources')

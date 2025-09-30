@@ -30,9 +30,11 @@ class OutBase(PosDataBase):
     sources : np.ndarray
         (N, 2) Set of voxel sources as (Module ID, TPC ID) pairs
     module_ids : np.ndarray
-        (M) List of module indexes that make up this object
+        (M) List of unique module indexes that make up this object
     is_contained : bool
         Whether this object is fully contained within the detector
+    is_time_contained : bool
+        Whether this object's points are within the expected readout window
     is_matched: bool
         True if a true object match was found
     match_ids : np.ndarray
@@ -43,8 +45,9 @@ class OutBase(PosDataBase):
         True if the particle crossed a cathode, i.e. if it is made up
         of space points coming from > 1 TPC in one module
     cathode_offset : float
-        If the particle is a cathode crosser, this corresponds to the offset
-        to apply to the particle to match its components at the cathode
+        If the particle is a cathode crosser, this is how far in cm one needs to
+        move its points along the drift direction to reconcile at the cathode.
+        This is directly proportional to time through time=offset/vdrift
     is_truth: bool
         Whether this object contains truth information or not
     units : str
@@ -59,6 +62,7 @@ class OutBase(PosDataBase):
     sources: np.ndarray = None
     module_ids: np.ndarray = None
     is_contained: bool = False
+    is_time_contained: bool = False
     is_matched: bool = False
     match_ids: np.ndarray = None
     match_overlaps: np.ndarray = None
@@ -77,7 +81,8 @@ class OutBase(PosDataBase):
 
     # Boolean attributes
     _bool_attrs = (
-            'is_contained', 'is_matched', 'is_cathode_crosser', 'is_truth'
+            'is_contained', 'is_time_contained', 'is_matched',
+            'is_cathode_crosser', 'is_truth'
     )
 
     # Attributes to concatenate when merging objects
@@ -88,6 +93,16 @@ class OutBase(PosDataBase):
 
     # Attributes that must not be stored to file when storing lite files
     _lite_skip_attrs = ('index',)
+
+    def reset_match(self):
+        """Resets the reco/truth matching information for the object."""
+        self.is_matched = False
+        self.match_ids = np.empty(0, dtype=np.int64)
+
+    def reset_cathode_crosser(self):
+        """Resets the cathode crossing information for the object."""
+        self.is_cathode_crosser = False
+        self.cathode_offset = -np.inf
 
     @property
     def size(self):
@@ -163,8 +178,6 @@ class TruthBase(OutBase):
         label tensor
     points_adapt : np.ndarray
         (N', 3) Set of voxel coordinates using adapted cluster labels
-    sources_adapt : np.ndarray
-        (N', 2) Set of voxel sources as (Module ID, TPC ID) pairs, adapted
     depositions_adapt : np.ndarray
         (N') Array of values for each voxel in the adapted cluster label tensor
     depositions_adapt_sum : float
@@ -210,7 +223,7 @@ class TruthBase(OutBase):
     _var_length_attrs = (
             ('depositions_q', np.float32), ('index_adapt', np.int64),
             ('depositions_adapt', np.float32), ('depositions_adapt_q', np.float32),
-            ('index_g4', np.int64), ('depositions_g4', np.int64),
+            ('index_g4', np.int64), ('depositions_g4', np.float32),
             ('points_adapt', (3, np.float32)), ('sources_adapt', (2, np.int64)),
             ('points_g4', (3, np.float32)), *OutBase._var_length_attrs
     )
