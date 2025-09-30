@@ -3,7 +3,7 @@
 def setup_cnn_configuration(self, reps, depth, filters, input_kernel=3,
                             data_dim=3, num_input=1, allow_bias=False,
                             activation='lrelu', norm_layer='batch_norm',
-                            spatial_size=None):
+                            spatial_size=None, dropout=False):
     """Base function for global network parameters (CNN-based models).
 
     This avoids repeating the same base configuration parsing everywhere.
@@ -39,6 +39,8 @@ def setup_cnn_configuration(self, reps, depth, filters, input_kernel=3,
     spatial_size : int, optional
         Size of the input image in number of voxels per data_dim. This is only
         necessary when passing the normalized coordinates as features.
+    dropout : bool, default False
+        Whether to add dropout layers after each convolution block
     """
     # Store the base parameters
     self.reps = reps
@@ -58,3 +60,4 @@ def setup_cnn_configuration(self, reps, depth, filters, input_kernel=3,
 
     # Store the normalization function configuration
     self.norm_cfg = norm_layer
+    self.dropout = dropout

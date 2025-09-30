@@ -92,6 +92,11 @@ class UResNetEncoder(torch.nn.Module):
             encoder_tensors.append(x)
             x = self.encoding_conv[i](x)
 
+            if self.dropout:
+                dropout_rate = min(0.4, 0.2+0.05*i)
+                x = ME.MinkowskiDropout(dropout_rate)(x)
+                #print(f"[Encoder] layer {i} dropout rate: {dropout_rate:.2f}")
+
         result = {
             'encoder_tensors': encoder_tensors,
             'final_tensor': x
@@ -168,6 +173,10 @@ class UResNetDecoder(torch.nn.Module):
         for i, layer in enumerate(self.decoding_conv):
             encoder_tensor = encoder_tensors[-i-2]
             x = layer(x)
+            if i < (len(self.decoding_conv)-1) and self.dropout:
+                dropout_rate = max(0.4-0.05*i,0.1)
+                x = ME.MinkowskiDropout(dropout_rate)(x)
+                #print(f"[Decoder] layer {i} dropout rate: {dropout_rate:.2f}")
             x = ME.cat(encoder_tensor, x)
             x = self.decoding_block[i](x)
             decoder_tensors.append(x)
