@@ -216,7 +216,7 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
 
     def process_loss_config(self, loss='ce', ghost_label=-1, alpha=1.0,
                             beta=1.0, balance_loss=False,
-                            upweight_points=False, upweight_radius=20):
+                            upweight_points=False, upweight_radius=20, lambda_dice=None):
         """Process the loss function parameters.
 
         Parameters
@@ -236,9 +236,35 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
             provided as `point_label` as a loss input)
         upweight_radius: bool, default False
             Radius around the points of interest for which to upweight the loss
+        lambda_dice : float, default None
+            Weighting factor for the DICE loss component. If None, no DICE
+            loss is used.
         """
         # Set the loss function
-        self.loss_fn = loss_fn_factory(loss, reduction='none')
+        if lambda_dice is None:
+            self.loss_fn = loss_fn_factory(loss, reduction='none')
+        else:
+            try:
+                self.loss_fn = loss_fn_factory(loss, reduction='none', lambda_dice=lambda_dice)
+            except KeyError:
+                raise ValueError(
+                        f"Unknown loss function `{loss}` provided. "
+                        f"Available options are: {list(loss_fn_factory.keys())}")
+
+        try:
+            if lambda_dice is not None:
+                if loss != 'ce_dice':
+                    print(f"Warning: lambda_dice is only applicable for 'ce_dice' loss, ignoring for '{loss}'")
+                    self.loss_fn = loss_fn_factory(loss, reduction='none')
+                elif loss == 'ce_dice':
+                    # Standard case
+                    self.loss_fn = loss_fn_factory(loss, reduction='none', lambda_dice=lambda_dice)
+            else:
+                self.loss_fn = loss_fn_factory(loss, reduction='none')
+        except KeyError:
+            raise ValueError(
+                f"Unknown loss function `{loss}` provided. "
+                f"Available options are: {list(loss_dict.keys())}")
 
         # Store the loss configuration
         self.ghost_label     = ghost_label
@@ -455,9 +481,18 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
 
         # Compute the loss
         if weights is None:
-            loss = self.loss_fn(logits, labels).mean()
+            if hasattr(self.loss_fn, 'lambda_dice'):  # Check if it's a CE_DICE_Loss
+                ce_losses, dice_loss = self.loss_fn(logits, labels)
+                loss = ce_losses.mean() + self.loss_fn.lambda_dice * dice_loss
+            else:
+                loss = self.loss_fn(logits, labels).mean()
         else:
-            loss = (weights*self.loss_fn(logits, labels)).sum()/weights.sum()
+            if hasattr(self.loss_fn, 'lambda_dice'):  # Check if it's a CE_DICE_Loss
+                ce_losses, dice_loss = self.loss_fn(logits, labels)
+                # Only weight the CE part with sample weights
+                loss = (weights * ce_losses).sum() / weights.sum() + self.loss_fn.lambda_dice * dice_loss
+            else:
+                loss = (weights * self.loss_fn(logits, labels)).sum() / weights.sum()
 
         # Compute the accuracies
         with torch.no_grad():

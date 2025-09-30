@@ -11,6 +11,8 @@ from .cnn.encoder import SparseResidualEncoder
 
 from .common import losses, metric, final
 
+from spine.model.experimental.segmentation.losses import CE_DICE_Loss
+
 __all__ = ['loss_fn_factory', 'metric_fn_fatory', 'encoder_factory',
            'final_factory']
 
@@ -32,6 +34,7 @@ def loss_fn_factory(cfg, functional=False, **kwargs):
     object
         Instantiated loss function
     """
+
     loss_dict = {
         'ce': nn.CrossEntropyLoss,
         'bce': nn.BCELoss,
@@ -43,6 +46,7 @@ def loss_fn_factory(cfg, functional=False, **kwargs):
         'mse': nn.MSELoss,
         'evd': EVDLoss, # TODO move
         'edl': EDLRegressionLoss, # TODO move
+        'ce_dice': CE_DICE_Loss,
         **module_dict(losses)
     }
 
@@ -58,19 +62,34 @@ def loss_fn_factory(cfg, functional=False, **kwargs):
     }
 
     if not functional:
-        return instantiate(loss_dict, cfg, **kwargs)
+        if isinstance(cfg, dict) and cfg.get('name') == 'ce_dice':
+            # Extract CE_DICE specific parameters
+            lambda_dice = cfg.get('lambda_dice', 0.5)  # Default lambda_dice if not specified
+
+            # Create the CE_DICE_Loss with specific parameters
+            return CE_DICE_Loss(
+                reduction=kwargs.get('reduction', 'none'),
+                lambda_dice=lambda_dice
+            )
+        else:
+            # For all other losses, use the standard instantiation
+            return instantiate(loss_dict, cfg, **kwargs)
 
     else:
         assert (isinstance(cfg, str) or
                 ('name' in cfg and len(cfg) == 1)), (
-                        "For a functional, only provide the function name.")
+            "For a functional, only provide the function name.")
 
         name = cfg if isinstance(cfg, str) else cfg['name']
+        if name == 'ce_dice':
+            ce_dice_instance = CE_DICE_Loss(**kwargs)
+            return lambda pred, target: ce_dice_instance(pred, target)
+
         try:
             return loss_dict_func[name]
         except KeyError as err:
             raise KeyError(f"Could not find the functional {name} in the "
-                           f"availabel list: {loss_dict_func.keys()}")
+                           f"available list: {list(loss_dict_func.keys())}")
 
 def metric_fn_factory(cfg):
     """Instantiates a metric function from a configuration dictionary.
