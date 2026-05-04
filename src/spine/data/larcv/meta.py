@@ -73,9 +73,21 @@ class ImageMetaBase(DataBase):
                 "all must be initialized with valid values"
             )
 
-        # Validate that the count and size yield the correct upper bound
-        expected_upper = self.lower + self.size * self.count
-        if not np.allclose(self.upper, expected_upper, equal_nan=True):
+        # Validate that the count and size yield the correct upper bound.
+        # Use float64 intermediates and a tolerance appropriate for float32
+        # detector coordinates (O(100s) cm), where float32 rounding across
+        # many voxels can introduce errors of ~1e-4 cm.
+        expected_upper = (
+            self.lower.astype(np.float64)
+            + self.size.astype(np.float64) * self.count.astype(np.float64)
+        )
+        if not np.allclose(
+            self.upper.astype(np.float64),
+            expected_upper,
+            rtol=1e-5,
+            atol=1e-3,
+            equal_nan=True,
+        ):
             raise ValueError(
                 "Upper must be equal to lower + size * count (within numerical precision)"
             )
