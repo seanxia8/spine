@@ -139,7 +139,7 @@ class ModelManager:
 
     def initialize_train(self, optimizer, weight_prefix='snapshot',
                          restore_optimizer=False, save_step=-1,
-                         lr_scheduler=None):
+                         lr_scheduler=None, accum_steps=1):
         """Initialize the training regimen.
 
         Parameters
@@ -163,6 +163,7 @@ class ModelManager:
         self.weight_prefix = weight_prefix
         self.save_step = save_step
         self.restore_optimizer = restore_optimizer
+        self.accum_steps = accum_steps
 
         # Make a directory for the weight files, if need be
         save_dir = os.path.dirname(weight_prefix)
@@ -211,8 +212,8 @@ class ModelManager:
             Dictionary of model and loss outputs
         """
         # Reset the gradient accumulation, free memory
-        if self.train:
-            self.optimizer.zero_grad(set_to_none=True)
+        #if self.train:
+        #    self.optimizer.zero_grad(set_to_none=True)
 
         # Run the model forward
         self.watch.start('forward')
@@ -224,7 +225,7 @@ class ModelManager:
             assert 'loss' in result, (
                     "Every model must return a `loss` value to be trained.")
             self.watch.start('backward')
-            self.backward(result['loss'])
+            self.backward(result['loss'], iteration)
             self.watch.stop('backward')
 
         # If training and at an appropriate iteration, save model state
@@ -486,7 +487,6 @@ class ModelManager:
 
             # Apply the model forward
             result = self.net(**input_dict)
-
             # Compute the loss if one is specified, append results
             if self.loss_dict:
                 if not self.time_dependant:
@@ -497,23 +497,33 @@ class ModelManager:
 
         return result
 
-    def backward(self, loss):
+    def backward(self, loss, iteration=None):
         """Run the backward step on the model.
 
         Parameters
         ----------
         loss : torch.tensor
             Scalar loss value to step the model weights
+        iteration: int
+            Iteration, matters for mini-batches
         """
+
+        if self.accum_steps > 1:
+            assert iteration is not None, (
+                "Must provide iteration when using gradient accumulation")
+
         # Run the model backward
+        loss = loss / self.accum_steps
         loss.backward()
 
-        # Step the optimizer
-        self.optimizer.step()
+        if iteration is None or (iteration+1) % self.accum_steps == 0:
+            # Step the optimizer
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
 
-        # Step the learning rate scheduler
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+            # Step the learning rate scheduler
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
 
         # If the model has a buffer that needs to be updated, do it after
         # the trainable parameter update
