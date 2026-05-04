@@ -12,8 +12,10 @@ def model_dict():
     from . import full_chain
     from . import uresnet
     from . import uresnet_ppn
+    from . import uresnet_attn
     #from . import spice
     from . import graph_spice
+    from . import graph_spice_iterate
     from . import grappa
     from . import image
     #from . import singlep
@@ -35,9 +37,15 @@ def model_dict():
         ),
 
         # UResNet + PPN
-        'uresnet_ppn': (
+        "uresnet_ppn": (
             uresnet_ppn.UResNetPPN,
             uresnet_ppn.UResNetPPNLoss
+        ),
+
+        # UResNet + Attn
+        "uresnet_attn": (
+            uresnet_attn.UResNetAttnSegmentation,
+            uresnet_attn.SegmentationLossAttn
         ),
 
         # SPICE
@@ -47,6 +55,11 @@ def model_dict():
         "graph_spice": (
             graph_spice.GraphSPICE,
             graph_spice.GraphSPICELoss
+        ),
+
+        "graph_spice_iter": (
+            graph_spice_iterate.GraphSPICEIter,
+            graph_spice_iterate.GraphSPICEIterLoss
         ),
 
         # Graph neural network Particle Aggregation (GrapPA)
