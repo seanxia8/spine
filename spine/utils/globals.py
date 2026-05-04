@@ -246,3 +246,9 @@ LAR_x0     = 0.2000
 LAR_x1     = 3.0000
 LAR_Cbar   = 5.2146
 LAR_delta0 = 0.00
+
+#UResNet up weight options
+UPWEIGHT_METHOD = {'vertex': 0, 'Vertex': 0, 'VERTEX': 0, 'V': 0,
+                   'instance': 1, 'Instance': 1, 'INSTANCE': 1, 'I': 1,
+                   'class': 2, 'Class': 2, 'CLASS': 2, 'C': 2,
+                   }
