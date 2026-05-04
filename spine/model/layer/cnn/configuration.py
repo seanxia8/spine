@@ -3,7 +3,11 @@
 def setup_cnn_configuration(self, reps, depth, filters, input_kernel=3,
                             data_dim=3, num_input=1, allow_bias=False,
                             activation='lrelu', norm_layer='batch_norm',
-                            spatial_size=None, dropout=False):
+                            spatial_size=None, dropout=False,
+                            lower=(181, 0, 0), upper=(2571, 1056, 5966),
+                            attn_win_size=(230, 100, 570),
+                            embed_dim=256, num_heads=8, attn_gain=0.75,
+                            attn_mode='boundary'):
     """Base function for global network parameters (CNN-based models).
 
     This avoids repeating the same base configuration parsing everywhere.
@@ -41,6 +45,16 @@ def setup_cnn_configuration(self, reps, depth, filters, input_kernel=3,
         necessary when passing the normalized coordinates as features.
     dropout : bool, default False
         Whether to add dropout layers after each convolution block
+    num_vox: default (2500, 2500, 2500)
+        Detector number of voxels along each axis
+    attn_win_size: default (200, 200, 200)
+        Local window size for attention
+    embed_dim: int, default 256
+        Embedding space dimension for attention
+    num_heads: int, default 8
+        Number of heads per attention
+    attn_gain: float, default 0.75
+        Gain for applying attention gate weight
     """
     # Store the base parameters
     self.reps = reps
@@ -61,3 +75,11 @@ def setup_cnn_configuration(self, reps, depth, filters, input_kernel=3,
     # Store the normalization function configuration
     self.norm_cfg = norm_layer
     self.dropout = dropout
+    self.lower = lower
+    self.upper = upper
+    self.attn_win_size = attn_win_size
+    self.embed_dim = embed_dim
+    self.num_heads = num_heads
+    self.attn_gain = attn_gain
+    self.attn_mode = attn_mode
+
