@@ -7,6 +7,7 @@ from spine.utils.factory import instantiate, module_dict
 
 from .cnn.encoder import SparseResidualEncoder
 from .common import final, losses, metric
+from .common.losses import CE_DICE_Loss, FocalLoss
 
 __all__ = ["loss_fn_factory", "metric_fn_fatory", "encoder_factory", "final_factory"]
 

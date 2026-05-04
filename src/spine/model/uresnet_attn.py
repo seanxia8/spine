@@ -11,7 +11,7 @@ import MinkowskiEngine as ME
 from spine.data import TensorBatch
 from spine.utils.globals import BATCH_COL, COORD_COLS, VALUE_COL, GHOST_SHP
 from spine.utils.logger import logger
-from spine.utils.torch_local import cdist_fast
+from spine.utils.torch.scripts import cdist_fast
 
 from .layer.factories import loss_fn_factory
 

@@ -16,6 +16,7 @@ __all__ = [
     "BinaryLogDiceCELoss",
     "BinaryLogDiceCEMincutLoss",
     "FocalLoss",
+    "CE_DICE_Loss",
 ]
 
 
@@ -475,3 +476,87 @@ class BinaryFocalLoss(nn.modules.loss._Loss):
             return out.sum()
         else:
             raise ValueError("Reduction function not recognized:", self.reduction)
+
+class CE_DICE_Loss(nn.Module):
+    """
+    Cross-Entropy + DICE loss for semantic segmentation.
+    """
+    def __init__(self, reduction='none', lambda_dice=0.5):
+        super(CE_DICE_Loss, self).__init__()
+        self.ce_loss = nn.CrossEntropyLoss(reduction=reduction)
+        self.dice_loss = DiceLoss()
+        self.lambda_dice = lambda_dice
+        self.reduction = reduction
+    def forward(self, pred_sparse, target_sparse):
+
+        ce_loss = self.ce_loss(pred_sparse, target_sparse)
+        target_one_hot = F.one_hot(target_sparse, num_classes=pred_sparse.shape[1]).float()
+        dice_loss = self.dice_loss(pred_sparse, target_one_hot)
+
+        return ce_loss, dice_loss
+
+class FocalLoss(nn.Module):
+    """
+    Multi-class focal loss, similar interface to nn.CrossEntropyLoss.
+
+    Args
+    ----
+    gamma : float
+        Focusing parameter (default: 2.0).
+    alpha : float, Tensor of shape (C,), or None.
+        - If float: scalar weight applied to all classes.
+        - If Tensor: per-class weight vector, alpha[c].
+        - If None: no alpha reweighting.
+    reduction : str
+        'none' | 'mean' | 'sum'
+    """
+    def __init__(self, gamma=2.0, alpha=None, reduction='none'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+        if alpha is None:
+            self.alpha = None
+        else:
+            # convert scalar or list to tensor
+            if isinstance(alpha, (list, tuple)):
+                alpha = torch.tensor(alpha, dtype=torch.float32)
+            elif isinstance(alpha, float):
+                alpha = torch.tensor([alpha], dtype=torch.float32)
+
+            self.register_buffer("alpha", alpha)
+
+    def forward(self, logits, target):
+        """
+        Parameters
+        ----------
+        logits: (N, C, ...)
+        target: (N,)
+        Returns
+        -------
+        """
+
+        logpt = F.log_softmax(logits, dim=1)                # (N*, C)
+        pt = logpt.exp()                                    # (N*, C)
+
+        # Select log-prob and prob of the true class
+        logpt = logpt.gather(1, target.unsqueeze(1)).squeeze(1)
+        pt = pt.gather(1, target.unsqueeze(1)).squeeze(1)
+
+        # Focal term
+        focal_term = (1 - pt).pow(self.gamma)
+        loss = -focal_term * logpt
+        # Optional alpha [(C,) tuple]
+        if self.alpha is not None:
+            if self.alpha.numel() == 1:
+                loss = self.alpha * loss
+            else:
+                alpha_t = self.alpha[target]
+                loss = alpha_t * loss
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss

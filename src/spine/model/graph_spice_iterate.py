@@ -4,7 +4,7 @@ import torch
 
 from spine.data import TensorBatch, IndexBatch
 from spine.utils.cluster.graph import ClusterGraphConstructor
-from spine.utils.enums import enum_factory
+from spine.constants.factory import enum_factory
 from spine.utils.globals import (
     SHAPE_COL, SHOWR_SHP, TRACK_SHP, DELTA_SHP, MICHL_SHP)
 from .layer.cluster import kernel_factory, loss_factory

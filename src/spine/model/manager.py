@@ -270,7 +270,7 @@ class ModelManager:
                 "loss" in result
             ), "Every model must return a `loss` value to be trained."
             self.watch.start("backward")
-            self.backward(result["loss"])
+            self.backward(result["loss"], iteration)
             self.watch.stop("backward")
 
         # If training and at an appropriate iteration, save model state

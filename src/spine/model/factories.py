@@ -7,7 +7,7 @@ def model_dict():
         Dictionary of available models
     """
 
-    from . import full_chain, graph_spice, grappa, image, uresnet, uresnet_ppn
+    from . import full_chain, graph_spice, graph_spice_iterate, grappa, image, uresnet, uresnet_ppn, uresnet_attn
 
     # from . import singlep
     # from . import bayes_uresnet
