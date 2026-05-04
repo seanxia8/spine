@@ -2,17 +2,19 @@
 """Check that all the input files were processed and produced an output with
 the expected number of events for each input file."""
 
-import os
 import argparse
+import os
 
 import h5py
 import numpy as np
+from larcv import larcv  # pylint: disable=W0611
+from ROOT import TFile  # pylint: disable=E0611
 from tqdm import tqdm
-from ROOT import TFile # pylint: disable=E0611
-from larcv import larcv # pylint: disable=W0611
 
 
-def main(source, source_list, output, dest, suffix, event_list, tree_name, larcv_output):
+def main(
+    source, source_list, output, dest, suffix, event_list, tree_name, larcv_output
+):
     """Checks the output of the SPINE process.
 
     The script loops over the input files, check that there is an output file
@@ -51,17 +53,17 @@ def main(source, source_list, output, dest, suffix, event_list, tree_name, larcv
     """
     # If using source list, read it in
     if source_list is not None:
-        with open(source_list, 'r', encoding='utf-8') as f:
+        with open(source_list, "r", encoding="utf-8") as f:
             source = f.read().splitlines()
 
     # Initialize the output text file
-    out_file = open(output, 'w', encoding='utf-8')
+    out_file = open(output, "w", encoding="utf-8")
 
     # If it is provided, parse the list of (run, subrun, event) triplets
     if event_list is not None:
-        with open(event_list, 'r', encoding='utf-8') as f:
+        with open(event_list, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
-            line_list = [l.replace(',', ' ').split() for l in lines]
+            line_list = [l.replace(",", " ").split() for l in lines]
             event_list = [(int(r), int(s), int(e)) for r, s, e in line_list]
 
     # Loop over the list of files in the input
@@ -73,25 +75,25 @@ def main(source, source_list, output, dest, suffix, event_list, tree_name, larcv
         stem, _ = os.path.splitext(base)
 
         # Check that the output exists under the expected path
-        ext = '.h5' if not larcv_output else '.root'
-        out_base = f'{stem}_{suffix}{ext}'
-        out_path = f'{dest}/{out_base}'
+        ext = ".h5" if not larcv_output else ".root"
+        out_base = f"{stem}_{suffix}{ext}"
+        out_path = f"{dest}/{out_base}"
         if not os.path.isfile(out_path):
             tqdm.write(f"- Missing: {out_base}")
-            out_file.write(f'{file_path}\n')
+            out_file.write(f"{file_path}\n")
             miss_list.append(file_path)
             continue
 
         # If the output does exist, check that the input and output have the
         # expected number of entries. If ROOT, get the tree name first.
-        larcv_input = file_path.endswith('.root')
+        larcv_input = file_path.endswith(".root")
         if larcv_input:
-            f = TFile(file_path, 'r')
+            f = TFile(file_path, "r")
             if tree_name is None:
                 key = [key.GetName() for key in f.GetListOfKeys()][0]
             else:
-                key = f'{tree_name}_tree'
-            key_b = key.replace('_tree', '_branch')
+                key = f"{tree_name}_tree"
+            key_b = key.replace("_tree", "_branch")
 
         # Dispatch depending if the event list is provided or not
         if event_list is None:
@@ -101,20 +103,20 @@ def main(source, source_list, output, dest, suffix, event_list, tree_name, larcv
                 f.Close()
             else:
                 with h5py.File(file_path) as f:
-                    num_entries = len(f['events'])
+                    num_entries = len(f["events"])
 
             # Then check the number of events in the output file
             if larcv_output:
-                f = TFile(out_path, 'r')
+                f = TFile(out_path, "r")
                 out_num_entries = getattr(f, key).GetEntries()
                 f.Close()
             else:
                 with h5py.File(out_path) as f:
-                    out_num_entries = len(f['events'])
+                    out_num_entries = len(f["events"])
 
             if out_num_entries != num_entries:
                 tqdm.write(f"- Incomplete: {out_base}")
-                out_file.write(f'{file_path}\n')
+                out_file.write(f"{file_path}\n")
                 inc_list.append(file_path)
 
         else:
@@ -131,14 +133,14 @@ def main(source, source_list, output, dest, suffix, event_list, tree_name, larcv
                 f.Close()
             else:
                 with h5py.File(file_path) as f:
-                    for (run, subrun, event) in f['run_info']:
+                    for run, subrun, event in f["run_info"]:
                         check_list.append((run, subrun, event))
 
             # Check that the events which should appear are present
             with h5py.File(out_path) as f:
-                if len(f['events']) != len(check_list):
+                if len(f["events"]) != len(check_list):
                     tqdm.write(f"- Incomplete: {out_base}")
-                    out_file.write(f'{file_path}\n')
+                    out_file.write(f"{file_path}\n")
                     inc_list.append(file_path)
 
     num_miss = len(miss_list)
@@ -156,39 +158,63 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Check dataset validity")
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--source', '-s',
-                       help='Path or list of paths to data files',
-                       type=str, nargs="+")
-    group.add_argument('--source-list', '-S',
-                       help='Path to a text file of data file paths',
-                       type=str)
+    group.add_argument(
+        "--source",
+        "-s",
+        help="Path or list of paths to data files",
+        type=str,
+        nargs="+",
+    )
+    group.add_argument(
+        "--source-list", "-S", help="Path to a text file of data file paths", type=str
+    )
 
-    parser.add_argument('--output', '-o',
-                        help='Path to the output text file with the problematic list',
-                        type=str, required=True)
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Path to the output text file with the problematic list",
+        type=str,
+        required=True,
+    )
 
-    parser.add_argument('--dest',
-                        help='Destination directory for the original SPINE process',
-                        type=str, required=True)
+    parser.add_argument(
+        "--dest",
+        help="Destination directory for the original SPINE process",
+        type=str,
+        required=True,
+    )
 
-    parser.add_argument('--suffix',
-                        help='Suffix added to the input files by the original SPINE process',
-                        type=str, required=True)
+    parser.add_argument(
+        "--suffix",
+        help="Suffix added to the input files by the original SPINE process",
+        type=str,
+        required=True,
+    )
 
-    parser.add_argument('--event-list',
-                        help='File containing a list of events to process.',
-                        type=str)
+    parser.add_argument(
+        "--event-list", help="File containing a list of events to process.", type=str
+    )
 
-    parser.add_argument('--tree-name',
-                        help='TTree name used to count the entries.',
-                        type=str)
+    parser.add_argument(
+        "--tree-name", help="TTree name used to count the entries.", type=str
+    )
 
-    parser.add_argument('--larcv-output',
-                        help='The output of the process is another LArCV file',
-                        action='store_true')
+    parser.add_argument(
+        "--larcv-output",
+        help="The output of the process is another LArCV file",
+        action="store_true",
+    )
 
     args = parser.parse_args()
 
     # Execute the main function
-    main(args.source, args.source_list, args.output, args.dest, args.suffix,
-         args.event_list, args.tree_name, args.larcv_output)
+    main(
+        args.source,
+        args.source_list,
+        args.output,
+        args.dest,
+        args.suffix,
+        args.event_list,
+        args.tree_name,
+        args.larcv_output,
+    )

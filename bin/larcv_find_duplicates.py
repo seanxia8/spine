@@ -4,9 +4,9 @@
 import argparse
 
 import numpy as np
+from larcv import larcv  # pylint: disable=W0611
+from ROOT import TFile  # pylint: disable=E0611
 from tqdm import tqdm
-from ROOT import TFile # pylint: disable=E0611
-from larcv import larcv # pylint: disable=W0611
 
 
 def main(source, source_list, output, tree_name):
@@ -31,23 +31,23 @@ def main(source, source_list, output, tree_name):
     """
     # If using source list, read it in
     if source_list is not None:
-        with open(source_list, 'r', encoding='utf-8') as f:
+        with open(source_list, "r", encoding="utf-8") as f:
             source = f.read().splitlines()
 
     # Initialize the output text file
-    out_file = open(output, 'w', encoding='utf-8')
+    out_file = open(output, "w", encoding="utf-8")
 
     # Loop over the list of files in the input
     print(f"\nGathering information from {len(source)} files:")
     values = np.empty((len(source), 4), dtype=int)
     for idx, file_path in enumerate(tqdm(source)):
         # Get the tree to get the number of entries from
-        f = TFile(file_path, 'r')
+        f = TFile(file_path, "r")
         if tree_name is None:
             key = [key.GetName() for key in f.GetListOfKeys()][0]
         else:
-            key = f'{tree_name}_tree'
-        branch_key = key.replace('_tree', '_branch')
+            key = f"{tree_name}_tree"
+        branch_key = key.replace("_tree", "_branch")
 
         # Check the number of entries in the file
         tree = getattr(f, key)
@@ -64,7 +64,8 @@ def main(source, source_list, output, tree_name):
     # Loop over non-unique files
     print(f"\nChecking for duplicates among {len(source)} files:")
     _, inverse, counts = np.unique(
-            values, axis=0, return_inverse=True, return_counts=True)
+        values, axis=0, return_inverse=True, return_counts=True
+    )
     duplicate_files = []
     for idx in tqdm(np.where(counts > 1)[0]):
         # Build a file mask for this class of duplicates
@@ -75,7 +76,7 @@ def main(source, source_list, output, tree_name):
         for i in range(1, len(index)):
             file_path = source[index[i]]
             duplicate_files.append(file_path)
-            out_file.write(f'{file_path}\n')
+            out_file.write(f"{file_path}\n")
             tqdm.write(f"  - Duplicate file: {file_path}")
 
     print(f"\nFound {len(duplicate_files)} duplicate files.")
@@ -89,20 +90,28 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Count entries in dataset")
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--source', '-s',
-                       help='Path or list of paths to data files',
-                       type=str, nargs="+")
-    group.add_argument('--source-list', '-S',
-                       help='Path to a text file of data file paths',
-                       type=str)
+    group.add_argument(
+        "--source",
+        "-s",
+        help="Path or list of paths to data files",
+        type=str,
+        nargs="+",
+    )
+    group.add_argument(
+        "--source-list", "-S", help="Path to a text file of data file paths", type=str
+    )
 
-    parser.add_argument('--output', '-o',
-                        help='Path to the output text file with the duplicate list',
-                        type=str, required=True)
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Path to the output text file with the duplicate list",
+        type=str,
+        required=True,
+    )
 
-    parser.add_argument('--tree-name',
-                        help='TTree name used to count the entries.',
-                        type=str)
+    parser.add_argument(
+        "--tree-name", help="TTree name used to count the entries.", type=str
+    )
 
     args = parser.parse_args()
 

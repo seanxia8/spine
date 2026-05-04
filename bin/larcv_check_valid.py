@@ -4,9 +4,9 @@
 import argparse
 
 import numpy as np
+from larcv import larcv  # pylint: disable=W0611
+from ROOT import TFile  # pylint: disable=E0611
 from tqdm import tqdm
-from ROOT import TFile # pylint: disable=E0611
-from larcv import larcv # pylint: disable=W0611
 
 
 def main(source, source_list, output):
@@ -33,11 +33,11 @@ def main(source, source_list, output):
     """
     # If using source list, read it in
     if source_list is not None:
-        with open(source_list, 'r', encoding='utf-8') as f:
+        with open(source_list, "r", encoding="utf-8") as f:
             source = f.read().splitlines()
 
     # Initialize the output text file
-    out_file = open(output, 'w', encoding='utf-8')
+    out_file = open(output, "w", encoding="utf-8")
 
     # Loop over the list of files in the input, count the tree entries for each
     print(f"\nCounting entries in every tree of {len(source)} files.")
@@ -68,10 +68,13 @@ def main(source, source_list, output):
     for idx, file_path in enumerate(tqdm(source)):
         # Check that there is only one entry count and it's non-zero, and
         # that the list of keys matches expectation
-        if (len(unique_counts[idx]) != 1 or unique_counts[idx][0] < 1 or
-            (set(keys_list[idx]) != set(all_keys))):
+        if (
+            len(unique_counts[idx]) != 1
+            or unique_counts[idx][0] < 1
+            or (set(keys_list[idx]) != set(all_keys))
+        ):
             tqdm.write(f"- Bad file: {file_path}")
-            out_file.write(f'{file_path}\n')
+            out_file.write(f"{file_path}\n")
             bad_files.append(file_path)
 
     print(f"\nFound {len(bad_files)} bad files.")
@@ -85,16 +88,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Check dataset validity")
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--source', '-s',
-                       help='Path or list of paths to data files',
-                       type=str, nargs="+")
-    group.add_argument('--source-list', '-S',
-                       help='Path to a text file of data file paths',
-                       type=str)
+    group.add_argument(
+        "--source",
+        "-s",
+        help="Path or list of paths to data files",
+        type=str,
+        nargs="+",
+    )
+    group.add_argument(
+        "--source-list", "-S", help="Path to a text file of data file paths", type=str
+    )
 
-    parser.add_argument('--output', '-o',
-                        help='Path to the output text file with the bad list',
-                        type=str, required=True)
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Path to the output text file with the bad list",
+        type=str,
+        required=True,
+    )
 
     args = parser.parse_args()
 

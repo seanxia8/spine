@@ -1,43 +1,213 @@
 <h1 align="center">
-<img src="https://github.com/DeepLearnPhysics/SPINE/blob/develop/docs/source/_static/img/spine-logo-dark.png" alt='SPINE', width="400">
+<img src="https://raw.githubusercontent.com/DeepLearnPhysics/spine/main/docs/source/_static/img/spine-logo-dark.png" alt='SPINE', width="400">
 </h1><br>
 
-[![Build Status](https://app.travis-ci.com/francois-drielsma/lartpc_mlreco3d.svg?token=WB4oxAv87vEXhuxUGH7e&branch=develop&status=passed)](https://app.travis-ci.com/github/francois-drielsma/lartpc_mlreco3d/logscans?serverType=git)
-[![Documentation Status](https://readthedocs.org/projects/lartpc-mlreco3d/badge/?version=latest)](https://lartpc-mlreco3d.readthedocs.io/en/latest/?badge=latest)
+[![CI](https://github.com/DeepLearnPhysics/spine/actions/workflows/ci.yml/badge.svg)](https://github.com/DeepLearnPhysics/spine/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/DeepLearnPhysics/spine/branch/main/graph/badge.svg)](https://codecov.io/gh/DeepLearnPhysics/spine)
+[![Documentation Status](https://readthedocs.org/projects/spine/badge/?version=latest)](https://spine.readthedocs.io/latest/)
+[![PyPI version](https://badge.fury.io/py/spine.svg)](https://badge.fury.io/py/spine)
+[![Python version](https://img.shields.io/pypi/pyversions/spine.svg)](https://pypi.org/project/spine/)
 
 The Scalable Particle Imaging with Neural Embeddings (SPINE) package leverages state-of-the-art Machine Learning (ML) algorithms -- in particular Deep Neural Networks (DNNs) -- to reconstruct particle imaging detector data. This package was primarily developed for Liquid Argon Time-Projection Chamber (LArTPC) data and relies on Convolutional Neural Networks (CNNs) for pixel-level feature extraction and Graph Neural Networks (GNNs) for superstructure formation. The schematic below breaks down the full end-to-end reconstruction flow.
 
-![Full chain](https://github.com/DeepLearnPhysics/spine/blob/develop/docs/source/_static/img/spine-chain-alpha.png)
+For full SPINE workflows, the recommended runtime is the published SPINE container image released alongside each SPINE version. Use the release-tagged image `ghcr.io/deeplearnphysics/spine:<release>` when reproducibility matters. When in doubt, use `ghcr.io/deeplearnphysics/spine:latest` or omit the tag entirely, which is equivalent in Docker-style image references. Docker is the most direct path on workstations and servers; Apptainer/Singularity is the preferred path on HPC systems that do not allow Docker. A local `pip` installation is mainly intended for post-processing, analysis, visualization, docs, or lightweight development.
+
+![Full chain](https://raw.githubusercontent.com/DeepLearnPhysics/spine/main/docs/source/_static/img/spine-chain-alpha.png)
 
 ## Installation
 
-We recommend using a Singularity or Docker containers pulled from [`deeplearnphysics/larcv2`](https://hub.docker.com/r/deeplearnphysics/larcv2), which contains all the necessary dependancy to run this package.
+SPINE supports both container-based and local Python installation workflows, but they are not equivalent.
 
-The dependencies include:
-* `MinkowskiEngine`
-* `larcv2`
-* `torch`
-* `torch_geometric`
-* `numba`
-* standard Python scientific libraries.
+### Recommended Runtime: Released SPINE Container
 
-This package does not need to be installed. Simply pull this repository and add it to the python path:
+Every SPINE release publishes a matching container image to GHCR. For end-to-end reconstruction, training, and inference, use a release tag when you want a pinned environment. When in doubt, use `latest` or omit the tag entirely:
 
-```python
-import sys
-sys.path.insert(0, '/path/to/spine/')
+```bash
+# Equivalent to: docker pull ghcr.io/deeplearnphysics/spine
+docker pull ghcr.io/deeplearnphysics/spine:latest
+
+# Example: replace <release> with a SPINE release tag such as 1.2.3
+docker pull ghcr.io/deeplearnphysics/spine:<release>
+```
+
+Omitting the tag is equivalent to using `latest` in Docker-style image references.
+
+### Docker Path
+
+Use Docker when you have a local workstation or server with container runtime support:
+
+```bash
+docker run --gpus all -v $(pwd):/workspace \
+    ghcr.io/deeplearnphysics/spine:latest \
+    spine --config /workspace/config/train_uresnet.yaml --source /workspace/data.h5
+
+# Or pin to a specific release
+docker run --gpus all -v $(pwd):/workspace \
+    ghcr.io/deeplearnphysics/spine:<release> \
+    spine --config /workspace/config/train_uresnet.yaml --source /workspace/data.h5
+```
+
+### Apptainer / Singularity Path
+
+Use Apptainer or Singularity on HPC systems that do not allow Docker directly. The recommended path is to pull the same released SPINE image from GHCR:
+
+```bash
+apptainer pull spine_latest.sif docker://ghcr.io/deeplearnphysics/spine:latest
+apptainer exec --nv spine_latest.sif \
+    spine --config /workspace/config/train_uresnet.yaml --source /workspace/data.h5
+
+# Or pin to a specific release
+apptainer pull spine_<release>.sif docker://ghcr.io/deeplearnphysics/spine:<release>
+apptainer exec --nv spine_<release>.sif \
+    spine --config /workspace/config/train_uresnet.yaml --source /workspace/data.h5
+```
+
+The Docker and Apptainer paths consume the same released image; the difference is only the container runtime.
+
+### Local Python Installation
+
+Use a local pip installation when you only need downstream tooling such as post-processing, analysis, visualization, documentation, or light development.
+
+### Installation Options
+
+**1. Core Package (minimal dependencies)**
+```bash
+# Essential dependencies: numpy, scipy, pandas, PyYAML, h5py, numba
+pip install spine
+```
+
+**2. With Visualization Tools**
+```bash
+# Adds plotly, matplotlib, seaborn for data visualization
+pip install spine[viz]
+```
+
+**3. Development Environment**
+```bash
+# Adds testing, formatting, and documentation tools
+pip install spine[dev]
+```
+
+**4. Everything (except PyTorch)**
+```bash
+# All optional dependencies (visualization + development tools)
+pip install spine[all]
+```
+
+### PyTorch ecosystem
+
+#### Option 1: Released SPINE container (recommended)
+
+The published SPINE image already includes the compatible PyTorch, torch-geometric, MinkowskiEngine, and LArCV stack. Use the release-tagged image through Docker or Apptainer as shown above.
+
+#### Option 2: Manual installation (advanced users)
+```bash
+# Step 1: Install PyTorch with CUDA
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+# Step 2: Install ecosystem packages (critical order)
+pip install --no-build-isolation torch-scatter torch-cluster torch-geometric MinkowskiEngine
+
+# Step 3: Install SPINE
+pip install spine[all]
+```
+
+> **Why the container is preferred**: the PyTorch ecosystem (torch, torch-geometric, torch-scatter, torch-cluster, MinkowskiEngine) forms an interdependent group requiring exact version compatibility and complex compilation. The released SPINE container pins that stack for you.
+
+### LArCV2
+
+#### Option 1: Use the released SPINE container (recommended)
+
+LArCV2 is already bundled in the published SPINE image.
+
+#### Option 2: Build from source
+```bash
+# Clone and build the latest LArCV2
+git clone https://github.com/DeepLearnPhysics/larcv2.git
+cd larcv2
+# Follow build instructions in the repository
+```
+
+> **Note**: Avoid conda-forge larcv packages as they may be outdated. Use the released SPINE container or build LArCV2 from the official source.
+
+### Development Installation
+
+For developers who want to work with the source code:
+```bash
+git clone https://github.com/DeepLearnPhysics/spine.git
+cd spine
+pip install -e .[dev]
+```
+
+#### Quick Development Testing (No Installation)
+
+For rapid development and testing without reinstalling the package:
+
+```bash
+# Clone the repository
+git clone https://github.com/DeepLearnPhysics/spine.git
+cd spine
+
+# Install only the dependencies (not the package itself)
+# Or alternatively simple run the commands inside the above container
+pip install numpy scipy pandas pyyaml h5py numba psutil
+
+# Run directly from source
+python src/spine/bin/run.py --config config/train_uresnet.yaml --source /path/to/data.h5
+
+# Or make it executable and run directly
+chmod +x src/spine/bin/run.py
+./src/spine/bin/run.py --config your_config.yaml --source data.h5
+```
+
+> **💡 Development Tip**: This approach lets you test code changes immediately without reinstalling. Perfect for rapid iteration during development.
+
+To build and test packages locally:
+```bash
+# Build the package
+./build_packages.sh
+
+# Install locally built package
+pip install dist/spine-*.whl[all]
 ```
 
 ## Usage
+
+### Command Line Interface
+
+**Option 1: Run from the released container:**
+
+```bash
+docker run --gpus all -v $(pwd):/workspace \
+    ghcr.io/deeplearnphysics/spine:<release> \
+    spine --config /workspace/config/train_uresnet.yaml --source /workspace/data.h5
+```
+
+**Option 2: After installation, use the `spine` command locally:**
+
+```bash
+# Run training/inference/analysis
+spine --config config/train_uresnet.yaml --source /path/to/data.h5
+```
+
+**Option 3: Run directly from source (development):**
+
+```bash
+# From the spine repository directory
+python src/spine/bin/run.py --config config/train_uresnet.yaml --source /path/to/data.h5
+```
+
+### Python API
+
 Basic example:
 ```python
 # Necessary imports
-import yaml
+from spine.config import load_config_file
 from spine.driver import Driver
 
-# Load configuration file
-with open('spine/config/train_uresnet.cfg', 'r') as f:
-    cfg = yaml.safe_load(f)
+# Load configuration file  
+cfg_path = 'config/train_uresnet.yaml'  # or your config file
+cfg = load_config_file(cfg_path)
 
 # Initialize driver class
 driver = Driver(cfg)
@@ -46,52 +216,53 @@ driver = Driver(cfg)
 driver.run()
 ```
 
-* Some tutorials are available at https://deeplearnphysics.org/lartpc_mlreco3d_tutorials/.
-* More technical documentation is available at https://lartpc-mlreco3d.readthedocs.io/.
+* Documentation is available at https://spine.readthedocs.io/latest/.
+* Tutorials and examples can be found in the documentation.
 
 ### Example Configuration Files
 
-For your inspiration, the following standalone configurations are available in the `config` folder:
+Example configurations are available in the `config` folder:
 
 | Configuration name            | Model          |
 | ------------------------------|----------------|
-| `train_uresnet.cfg`           | UResNet alone  |
-| `train_uresnet_ppn.cfg`       | UResNet + PPN  |
-| `train_graph_spice.cfg`       | GraphSpice     |
-| `train_grappa_shower.cfg`     | GrapPA for shower fragments clustering (particle fragments -> particle clusters) |
-| `train_grappa_interaction.cfg`| GrapPA for interaction clustering (particle clusters -> interactions) |
+| `train_uresnet.yaml`          | UResNet alone  |
+| `train_uresnet_ppn.yaml`      | UResNet + PPN  |
+| `train_graph_spice.yaml`      | GraphSpice     |
+| `train_grappa_shower.yaml`    | GrapPA for shower fragments clustering |
+| `train_grappa_track.yaml`     | GrapPA for track fragments clustering |
+| `train_grappa_inter.yaml`     | GrapPA for interaction clustering |
 
-Switching from train to test mode is as simple as switching `trainval.train: False` for all models. The only exception at the moment is GraphSpice, for which an example test configuration is provided (`test_graph_spice.cfg`).
+To switch from training to inference mode, set `trainval.train: False` in your configuration file.
 
-Typically in a configuration file the first things you may want to edit will be:
-* `batch_size` (in 2 places)
-* `weight_prefix` (where to save the model checkpoints)
-* `log_dir` (where to save the logs)
-* `iterations`
-* `model_path` (checkpoint to load, optional)
-* `train` (boolean)
-* `gpus` (leave empty '' if you want to run on CPU)
+Key configuration parameters you may want to modify:
+* `batch_size` - batch size for training/inference
+* `weight_prefix` - directory to save model checkpoints
+* `log_dir` - directory to save training logs
+* `iterations` - number of training iterations
+* `model_path` - path to checkpoint to load (optional)
+* `train` - boolean flag for training vs inference mode
+* `gpus` - GPU IDs to use (leave empty '' for CPU)
 
 
-If you want more information stored, such as network output tensors and post-processing outcomes, you can use `analysis` (scripts) and `outputs` (formatters)
-to store them in CSV format and run your custom analysis scripts (see folder `analysis`).
-
-This section has described how to use the contents of this repository to train variations of what has already been implemented.  To add your own models and analysis, you will want to know how to contribute to the `spine` module.
+For more information on storing analysis outputs and running custom analysis scripts, see the documentation on `outputs` (formatters) and `analysis` (scripts) configurations.
 
 ### Running A Configuration File
 
-Most basic usage is to use the `run` script.  From the `spine` folder:
+Basic usage with the `spine` command:
 ```bash
-nohup python3 bin/run.py train_gnn.cfg >> log_gnn.txt &
-```
-This will train a GNN specified in `config/train_gnn.cfg`, save checkpoints and logs to specified directories in the `cfg`, and output `stderr` and `stdout` to `log_gnn.txt`
+# Run training/inference directly
+spine --config config/train_uresnet.yaml --source /path/to/data.h5
 
-You can generally load a configuration file into a python dictionary using
+# Or run in background with logging
+nohup spine --config config/train_uresnet.yaml --source /path/to/data.h5 > log_uresnet.txt 2>&1 &
+```
+
+You can load a configuration file into a Python dictionary using:
 ```python
-import yaml
-# Load configuration file
-with open('spine/config/train_uresnet.cfg', 'r') as f:
-    cfg = yaml.load(f, Loader=yaml.Loader)
+from spine.config import load_config_file
+
+# Load configuration file with SPINE's config loader
+cfg = load_config_file('config/train_uresnet.yaml')
 ```
 
 ### Reading a Log
@@ -115,36 +286,65 @@ print(df.columns.values)
 ```
 
 ### Recording network output or running analysis
-We use [LArTPC MLReco3D Analysis Tools](./analysis/README.md) for all inference and high-level analysis related work. 
+Documentation for analysis tools and output formatting is available in the main documentation at https://spine.readthedocs.io/latest/.
 
 ## Repository Structure
-* `bin` contains very simple scripts that run the training/inference functions.
-* `config` has various example configuration files.
-* `docs` Documentation (in progress)
-* `spine` the main code lives there!
-* `test` some testing using Pytest
+* `bin` contains utility scripts for data processing
+* `config` has example configuration files
+* `docs` contains documentation source files  
+* `src/spine` contains the main package code
+* `test` contains unit tests using pytest
 
-Please consult the README of each folder respectively for more information.
+Please consult the documentation for detailed information about each component.
+
+## Testing and Coverage
+
+### Running Tests
+
+The SPINE package includes comprehensive unit tests using pytest:
+
+```bash
+# Run all tests
+pytest
+
+# Run tests for a specific module
+pytest test/test_data/
+
+# Run with verbose output
+pytest -v
+```
+
+### Checking Test Coverage
+
+Test coverage tracking helps ensure code quality and identify untested areas. Coverage reports are automatically generated in our CI pipeline and uploaded to [Codecov](https://codecov.io/gh/DeepLearnPhysics/spine).
+
+To check coverage locally:
+
+```bash
+# Run the coverage script (generates terminal, HTML, and XML reports)
+./bin/coverage.sh
+
+# Or run pytest with coverage flags directly
+pytest --cov=spine --cov-report=term --cov-report=html
+
+# View the HTML report
+open htmlcov/index.html
+```
+
+The coverage configuration is defined in `pyproject.toml` under `[tool.coverage.run]` and `[tool.coverage.report]`.
 
 ## Contributing
 
-Before you start contributing to the code, please see the [contribution guidelines](contributing.md).
+Before you start contributing to the code, please see the [contribution guidelines](CONTRIBUTING.md).
 
 ### Adding a new model
-You may be able to re-use a fair amount of code, but here is what would be necessary to do everything from scratch:
 
-1. Make sure you can load data you need.
+The SPINE framework is designed to be extensible. To add a new model:
 
-Parsers already exist for a variety of sparse tensor outputs as well as particle outputs.
+1. **Data Loading**: Parsers exist for various sparse tensor and particle outputs in `spine.io.core.parse`. If you need fundamentally different data formats, you may need to add new parsers or collation functions.
 
-The most likely place you would need to add something is to `spine/io/parsers.py`.
+2. **Model Implementation**: Add your model to the `spine.model` package. Include your model in the factory dictionary in `spine.model.factories` so it can be found by the configuration system.
 
-If the data you need is fundamentally different from data currently used, you may also need to add a collation function to `spine/iotools/collates.py`
+3. **Configuration**: Create a configuration file in the `config/` folder that specifies your model architecture and training parameters.
 
-2. Include your model
-
-You should put your model in a new file in the `spine/models` folder.
-
-Add your model to the dictionary in `spine/models/factories.py` so it can be found by the configuration parsers.
-
-At this point, you should be able to train your model using a configuration file.
+Once these steps are complete, you should be able to train your model using the standard SPINE workflow.
