@@ -11,7 +11,7 @@ from .cnn.encoder import SparseResidualEncoder
 
 from .common import losses, metric, final
 
-from spine.model.experimental.segmentation.losses import CE_DICE_Loss
+from spine.model.experimental.segmentation.losses import CE_DICE_Loss, FocalLoss
 
 __all__ = ['loss_fn_factory', 'metric_fn_fatory', 'encoder_factory',
            'final_factory']
@@ -47,6 +47,7 @@ def loss_fn_factory(cfg, functional=False, **kwargs):
         'evd': EVDLoss, # TODO move
         'edl': EDLRegressionLoss, # TODO move
         'ce_dice': CE_DICE_Loss,
+        'focal_loss': FocalLoss,
         **module_dict(losses)
     }
 
@@ -58,18 +59,23 @@ def loss_fn_factory(cfg, functional=False, **kwargs):
         'huber': nn.functional.huber_loss,
         'l1': nn.functional.l1_loss,
         'l2': nn.functional.mse_loss,
-        'mse': nn.functional.mse_loss
+        'mse': nn.functional.mse_loss,
     }
 
     if not functional:
         if isinstance(cfg, dict) and cfg.get('name') == 'ce_dice':
             # Extract CE_DICE specific parameters
-            lambda_dice = cfg.get('lambda_dice', 0.5)  # Default lambda_dice if not specified
-
-            # Create the CE_DICE_Loss with specific parameters
+            lambda_dice = cfg.get('lambda_dice', 0.5)
             return CE_DICE_Loss(
                 reduction=kwargs.get('reduction', 'none'),
                 lambda_dice=lambda_dice
+            )
+        elif isinstance(cfg, dict) and cfg.get('name') == 'focal_loss':
+            # Extract focal loss specific parameters
+            focal_gamma = cfg.get('focal_gamma', 2)
+            return FocalLoss(
+                reduction=kwargs.get('reduction', 'none'),
+                gamma=focal_gamma
             )
         else:
             # For all other losses, use the standard instantiation
@@ -84,12 +90,16 @@ def loss_fn_factory(cfg, functional=False, **kwargs):
         if name == 'ce_dice':
             ce_dice_instance = CE_DICE_Loss(**kwargs)
             return lambda pred, target: ce_dice_instance(pred, target)
-
+        elif name == "focal_loss":
+            focal_loss_instance = FocalLoss(**kwargs)
+            return lambda pred, target: focal_loss_instance(pred, target)
         try:
             return loss_dict_func[name]
         except KeyError as err:
             raise KeyError(f"Could not find the functional {name} in the "
                            f"available list: {list(loss_dict_func.keys())}")
+
+
 
 def metric_fn_factory(cfg):
     """Instantiates a metric function from a configuration dictionary.
