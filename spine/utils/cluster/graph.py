@@ -349,7 +349,7 @@ class ClusterGraphConstructor:
                     result[m].append(metric(node_pred_b, node_label_b))
 
                 # Loop over the semantic types
-                for s, shape in self.shapes:
+                for s, shape in enumerate(self.shapes):
                     # Narrow down the predictions and labels to this shape
                     node_index = graph['node_clusts'][b][s]
                     node_label_b_s = node_label_b[node_index]
