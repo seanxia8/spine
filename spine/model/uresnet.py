@@ -8,7 +8,8 @@ import torch.nn as nn
 import MinkowskiEngine as ME
 
 from spine.data import TensorBatch
-from spine.utils.globals import BATCH_COL, COORD_COLS, VALUE_COL, GHOST_SHP
+from spine.utils.globals import BATCH_COL, COORD_COLS, SHAPE_COL, VALUE_COL, GHOST_SHP
+from spine.utils.globals import UPWEIGHT_METHOD, LOWES_SHP
 from spine.utils.logger import logger
 from spine.utils.torch_local import cdist_fast
 
@@ -216,7 +217,9 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
 
     def process_loss_config(self, loss='ce', ghost_label=-1, alpha=1.0,
                             beta=1.0, balance_loss=False,
-                            upweight_points=False, upweight_radius=20, lambda_dice=None):
+                            upweight_points=False, upweight_type='instance', upweight_cap=3.,
+                            upweight_radius=20, lambda_dice=None, instance_wpower=None, cdist_chunk_size=None,
+                            focal_gamma=None, focal_alpha=None):
         """Process the loss function parameters.
 
         Parameters
@@ -240,27 +243,21 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
             Weighting factor for the DICE loss component. If None, no DICE
             loss is used.
         """
-        # Set the loss function
-        if lambda_dice is None:
-            self.loss_fn = loss_fn_factory(loss, reduction='none')
-        else:
-            try:
-                self.loss_fn = loss_fn_factory(loss, reduction='none', lambda_dice=lambda_dice)
-            except KeyError:
-                raise ValueError(
-                        f"Unknown loss function `{loss}` provided. "
-                        f"Available options are: {list(loss_fn_factory.keys())}")
-
         try:
             if lambda_dice is not None:
                 if loss != 'ce_dice':
                     print(f"Warning: lambda_dice is only applicable for 'ce_dice' loss, ignoring for '{loss}'")
-                    self.loss_fn = loss_fn_factory(loss, reduction='none')
+                    self.loss_fn = loss_fn_factory(loss, reduction="none")
                 elif loss == 'ce_dice':
                     # Standard case
-                    self.loss_fn = loss_fn_factory(loss, reduction='none', lambda_dice=lambda_dice)
+                    self.loss_fn = loss_fn_factory(loss, reduction="none", lambda_dice=lambda_dice)
+            elif instance_wpower is not None:
+                assert upweight_type == "instance", "Weighting by instance must specify the weighting power"
+                self.loss_fn = loss_fn_factory(loss, reduction="none")
+            elif loss == 'focal_loss':
+                self.loss_fn = loss_fn_factory(loss, gamma=focal_gamma, alpha=focal_alpha, reduction="none")
             else:
-                self.loss_fn = loss_fn_factory(loss, reduction='none')
+                self.loss_fn = loss_fn_factory(loss, reduction="none")
         except KeyError:
             raise ValueError(
                 f"Unknown loss function `{loss}` provided. "
@@ -272,7 +269,11 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
         self.beta            = beta
         self.balance_loss    = balance_loss
         self.upweight_points = upweight_points
-        self.upweight_radius = upweight_radius
+        self.upweight_type   = UPWEIGHT_METHOD[upweight_type]
+        self.instance_wpower = float(instance_wpower) if instance_wpower is not None else 0.5
+        self.upweight_radius = float(upweight_radius) if upweight_radius is not None else 15.
+        self.upweight_cap    = float(upweight_cap) if upweight_cap is not None else 3.
+        self.cdist_chunk_size = int(cdist_chunk_size) if cdist_chunk_size is not None else 2000
 
         # If a ghost label is provided, it cannot be in conjecture with
         # having a dedicated ghost masking layer
@@ -325,14 +326,24 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
 
         # If requested, produce weights based on point-proximity
         if self.upweight_points:
-            assert point_label is not None, (
-                    "If upweighting the loss nearby points of interests, must "
-                    "provide a list of such points in `point_label`.")
-            dist_weights = self.get_distance_weights(seg_label, point_label)
-            if weights is not None:
-                weights_t *= dist_weights.tensor
+            if self.upweight_type == 0:
+                assert point_label is not None, (
+                        "If upweighting the loss nearby points of interests, must "
+                        "provide a list of such points in `point_label`.")
+                assert self.upweight_radius > 0, "Need a radius value for upweighting by point proximity."
+                up_w = self.get_v_distance_weights(seg_label, point_label)
+            elif self.upweight_type == 1:
+                up_w = self.get_instance_weights(seg_label)
+            elif self.upweight_type == 2:
+                up_w = self.get_c_distance_weights(seg_label)
             else:
-                weights_t = dist_weights
+                raise RuntimeError("Undefined upweight method.")
+
+            if weights is not None:
+                weights_t *= up_w.tensor
+            else:
+                weights_t = up_w
+
 
         # Check that the labels have sensible values
         if self.ghost_label > -1:
@@ -390,7 +401,7 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
 
         return result
 
-    def get_distance_weights(self, seg_label, point_label):
+    def get_v_distance_weights(self, seg_label, point_label):
         """Define weights for each of the points in the image based on their
         distance from points of interests (typically vertices, but user defined).
 
@@ -430,9 +441,97 @@ class SegmentationLoss(torch.nn.modules.loss._Loss):
         counts = torch.tensor(
                 [len(dists) - close_count, close_count],
                 dtype=torch.long, device=dists.device)
-        weights = len(proximity)/2/counts
+        weights = torch.clamp(len(proximity)/2/counts, max=self.upweight_cap)
 
         return weights[proximity]
+
+    def get_c_distance_weights(self, seg_label):
+        """Define weights for each of the points in the image based on their
+        distance from the nearest voxel of different a semantic class.
+
+        Parameters
+        ----------
+        seg_label : TensorBatch
+            (N, 1 + D + 1) Tensor of segmentation labels for the batch
+
+        Returns
+        -------
+        torch.Tensor
+            (N) Array of weights associated with each point
+        """
+        seg_label_t = seg_label.tensor
+        coords_all = seg_label_t[:, COORD_COLS]  # (N, D)
+        labels_all = seg_label_t[:, VALUE_COL].long()  # (N,)
+
+        N_total = seg_label_t.size(0)
+        weights = torch.ones(N_total, device=seg_label_t.device, dtype=torch.float32)
+
+        for b in range(seg_label.batch_size):
+            mask_b = (seg_label_t[:,0] == b)
+            idx_b = mask_b.nonzero(as_tuple=False).squeeze(1)  # indices in the big tensor
+
+            coords = coords_all[idx_b]
+            labels = labels_all[idx_b]
+            Nb = coords.size(0)
+            if Nb <= 1: continue
+            min_dists = torch.full((Nb,), float('inf'), device=seg_label_t.device, dtype=torch.float32)
+
+            for i in range(0, Nb, self.cdist_chunk_size):
+                i_end = min(i + self.cdist_chunk_size, Nb)
+                coords_i = coords[i:i_end]  # (M, D)
+                labels_i = labels[i:i_end]  # (M,)
+                # (M, Nb) distance block
+                d_block = cdist_fast(coords_i, coords)
+                diff = labels_i[:, None] != labels[None, :]
+                neighbor_notLE = labels[None, :] != LOWES_SHP
+                valid = diff & neighbor_notLE
+                d_block = d_block.masked_fill(~valid, float('inf'))
+                block_min, _ = d_block.min(dim=1)  # (M,)
+                min_dists[i:i_end] = torch.minimum(min_dists[i:i_end], block_min)
+                del d_block, diff, block_min
+
+            finite_mask = torch.isfinite(min_dists)
+            if finite_mask.any():
+                max_d = min_dists[finite_mask].max()
+                min_dists[~finite_mask] = max_d
+            else:
+                continue
+
+            # --- Convert distances to weights ---
+            eps = 1e-3
+            score = 1.0 / (min_dists**0.5 + eps)  # near boundary → big, far → small
+            score = torch.clamp(score, max=(self.upweight_cap-1.))
+            weights_b = 1.0 + score
+            weights[idx_b] = weights_b
+
+        return weights
+
+    def get_instance_weights(self, labels):
+        seg_label_t = labels.tensor
+        label_t = seg_label_t[:, VALUE_COL].long()
+        counts = torch.empty(self.num_classes, dtype=torch.long, device=labels.device)
+        for c in range(self.num_classes):
+            counts[c] = torch.sum(label_t == c).item()
+        class_weight = torch.ones(len(counts), dtype=torch.float32, device=labels.device)
+        m = counts > 0
+        if m.any():
+            # effective exponent <= 0.5 to enforce max/min <= cap
+            counts_pos = counts[m]
+            cmax = counts_pos.max()
+            cmin = counts_pos.min()
+            ratio = (cmax / (cmin + 1e-9)).clamp(min=1.0)
+            cap = float(self.upweight_cap)
+
+            if ratio > 1.0:
+                alpha_max = torch.log(torch.tensor(cap, device=labels.device)) / torch.log(ratio)
+                alpha = min(self.instance_wpower, alpha_max.item())
+            else:
+                alpha = 0.0
+            base = (len(label_t) / self.num_classes)
+            class_weight[m] = base / (counts_pos ** alpha)
+
+        weights = class_weight[label_t]
+        return weights
 
     def get_loss_accuracy(self, logits, labels, weights=None):
         """Computes the loss, global and classwise accuracy.
