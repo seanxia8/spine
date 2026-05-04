@@ -111,7 +111,6 @@ class GraphSPICEEmbedder(nn.Module):
         else:
             raise ValueError(
                     f"Occupancy mode not recognized: {self.covariance_mode}")
-
     def forward(self, data):
         """Compute the embeddings for one batch of data.
         
