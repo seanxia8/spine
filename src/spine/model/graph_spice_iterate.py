@@ -74,7 +74,8 @@ class GraphSPICEIter(torch.nn.Module):
     def process_model_config(self, embedder, kernel, constructor,
                              shapes=[SHOWR_SHP, TRACK_SHP, MICHL_SHP, DELTA_SHP],
                              use_raw_features=False, invert=True,
-                             make_clusters=False, do_iterate=True):
+                             make_clusters=False, n_iterations=2,
+                             use_attention=True, do_iterate=None):
         """Initialize the underlying modules.
 
         Parameters
@@ -87,18 +88,41 @@ class GraphSPICEIter(torch.nn.Module):
             Edge index construction configuration
         shapes : List[str]
             List of shape names to construct clusters for
-        use_raw_features : bool, default True
+        use_raw_features : bool, default False
             Use the list of embedder features as is, without the output layers
         invert : bool, default True
             Invert the edge scores so that 0 is on an 1 is off
         make_clusters : bool, default False
             If `True`, builds a list of cluster indexes
-        iterate: bool, default True
-            If `False`, no feedback loop for attention mask from cluster ids
+        n_iterations : int, default 2
+            Total number of forward passes through the embedder.
+            1 = single-pass baseline (no graph feedback, no attention).
+            2 = one refinement step (original behaviour).
+            k > 2 = convergence study.
+        use_attention : bool, default True
+            If True, each refinement pass receives the previous cluster IDs as
+            attention conditioning. Set to False to ablate the attention while
+            keeping the iterative loop (iteration without attention).
+        do_iterate : bool, optional
+            Deprecated alias. If provided, overrides n_iterations:
+            False -> n_iterations=1, True -> n_iterations=2.
         """
+        # Backward compatibility with do_iterate flag
+        if do_iterate is not None:
+            n_iterations = 2 if do_iterate else 1
+
+        self.n_iter = n_iterations
+        self.use_attention = use_attention
+
+        # Build attention layers whenever n_iterations > 1 so the ablation
+        # (use_attention=False) shares the same architecture as the full system.
+        enable_attention = (n_iterations > 1)
+
         # Initialize the embedder
         self.embedder = AttnGraphSPICEEmbedder(
-                **embedder, use_raw_features=use_raw_features, enable_attention=do_iterate)
+                **embedder, use_raw_features=use_raw_features,
+                enable_attention=enable_attention)
+
         # Initialize the kernel function (must be owned here to be loaded)
         self.kernel_fn = kernel_factory(kernel)
 
@@ -106,7 +130,6 @@ class GraphSPICEIter(torch.nn.Module):
         self.constructor = ClusterGraphConstructor(
                 **constructor, kernel_fn=self.kernel_fn, shapes=shapes,
                 invert=invert, training=self.training)
-        #self.K = embedder.get("bn_topk", 4)
 
         # Parse the set of shapes to cluster
         self.shapes = enum_factory('shape', shapes)
@@ -115,7 +138,6 @@ class GraphSPICEIter(torch.nn.Module):
         self.use_raw_features = use_raw_features
         self.invert = invert
         self.make_clusters = make_clusters
-        self.do_iter = do_iterate
 
     def filter_class(self, data, seg_label, clust_label=None):
         """Filter the list of pixels to those in the list of requested shapes.
@@ -177,6 +199,13 @@ class GraphSPICEIter(torch.nn.Module):
         index = IndexBatch(index, offsets, data.counts)
 
         return data, seg_label, clust_label, index
+
+    def _get_features(self, result):
+        """Extract the features used by the kernel from an embedder result."""
+        if self.use_raw_features:
+            return result['features']
+        return result['hypergraph_features']
+
     def forward(self, data, seg_label, clust_label=None):
         """Run a batch of data through the forward function.
 
@@ -198,78 +227,82 @@ class GraphSPICEIter(torch.nn.Module):
         Returns
         -------
         dict
-            Dictionary of outputs
+            Dictionary of outputs. Always contains:
+            - 'filter_index': index mapping back to the original voxel set
+            - 'iter_used': number of iterations actually completed
+            - 'segmentation_iter1': segmentation logits from iteration 0
+            When n_iterations > 1 and the event is non-degenerate:
+            - 'segmentation': segmentation logits from the final iteration
+            - all graph constructor outputs (edge scores, node predictions, ...)
         """
         # Filter the input down to the requested shapes
         data, seg_label, clust_label, index = self.filter_class(
                 data, seg_label, clust_label)
-        # 1st iteration: run the embedder without attention
-        # Embed the input pixels into a feature space used for graph clustering
-        result_1 = self.embedder(data, cluster_id_full=None)
-        segmentation_iter1 = result_1['segmentation_iter1']
-        #result_1['segmentation_iter1'] = segmentation_iter1
-        # Build the graph on the pixel set
-        coords = result_1['coordinates']
-        if self.use_raw_features:
-            features = result_1['features']
-        else:
-            features = result_1['hypergraph_features']
-        #decoder_tensors = result_1['decoder_tensors']
-        coords = TensorBatch(coords.data[:, coords.coord_cols], coords.counts)
-        graph1 = self.constructor(coords, features, seg_label, clust_label)
 
-        if not self.do_iter:
+        # --- Iteration 0: unconditional pass, no cluster feedback ---
+        result = self.embedder(data, cluster_id_full=None)
+        segmentation_iter1 = result.get('segmentation_iter1')
+
+        # Coordinates are fixed across all iterations (only features change).
+        coords = result['coordinates']
+        coords = TensorBatch(coords.data[:, coords.coord_cols], coords.counts)
+
+        graph = self.constructor(coords, self._get_features(result),
+                                 seg_label, clust_label)
+
+        # Single-pass baseline: return immediately without any graph feedback.
+        if self.n_iter == 1:
             if self.make_clusters:
                 with torch.no_grad():
-                    clusts, clust_shapes = self.constructor.fit_predict(graph1)
+                    clusts, clust_shapes = self.constructor.fit_predict(graph)
+                result['clusts'] = clusts
+                result['clust_shapes'] = clust_shapes
+            result.update(graph)
+            result.update({'iter_used': 1, 'filter_index': index})
+            if segmentation_iter1 is not None:
+                result['segmentation_iter1'] = segmentation_iter1
+            return result
 
-                result_1['clusts'] = clusts
-                result_1['clust_shapes'] = clust_shapes
+        # --- Iterations 1 .. n_iter-1: cluster-conditioned refinement ---
+        for k in range(1, self.n_iter):
+            if self.use_attention:
+                # Obtain cluster IDs from the previous graph to condition
+                # the decoder's attention.
+                if 'node_pred' not in graph:
+                    with torch.no_grad():
+                        self.constructor.fit_predict(graph)
+                node_pred = graph.get('node_pred')
 
-            #result_1.update({"segmentation": None})
-            # Save the graph dictionary
-            result_1.update(graph1)
-            result_1.update({"iter_used": 1})
-            result_1['filter_index'] = index
-            return result_1
+                # Degenerate event: no clusters found, stop early.
+                if node_pred is None:
+                    result.update(graph)
+                    result.update({'iter_used': k, 'filter_index': index})
+                    if segmentation_iter1 is not None:
+                        result['segmentation_iter1'] = segmentation_iter1
+                    return result
 
-        if "node_pred" in graph1:
-            cluster_id_full = graph1["node_pred"]
-        else:
-            with torch.no_grad():
-                self.constructor.fit_predict(graph1)
-            cluster_id_full = graph1["node_pred"]
+                cluster_ids = node_pred.tensor.detach()
+            else:
+                # Ablation: iterate without attention conditioning.
+                cluster_ids = None
 
-        if cluster_id_full is None:
-            result_1.update({"iter_used": 1})
-            result_1['filter_index'] = index
-            result_1.update(graph1)
-            return result_1
+            result.clear()
+            del result
+            result = self.embedder(data, cluster_id_full=cluster_ids)
+            graph = self.constructor(coords, self._get_features(result),
+                                     seg_label, clust_label)
 
-        result_1.clear()
-        del result_1
-
-        result = self.embedder(data, cluster_id_full=cluster_id_full.tensor.detach())
-        # Store the index and the counts to not have to recompute them later
-        result['filter_index'] = index
-        #result['segmentation_iter1'] = segmentation_iter1
-        #coords = result["coordinates"]
-        if self.use_raw_features:
-            features = result['features']
-        else:
-            features = result['hypergraph_features']
-        #coords = TensorBatch(coords.data[:, coords.coord_cols], coords.counts)
-        graph2 = self.constructor(coords, features, seg_label, clust_label)
-        # If requested, convert edge predictions to node predictions
+        # --- Finalize ---
         if self.make_clusters:
             with torch.no_grad():
-                clusts, clust_shapes = self.constructor.fit_predict(graph2)
-
-            result['clusts'] = [ c.detach() for c in clusts ]
+                clusts, clust_shapes = self.constructor.fit_predict(graph)
+            result['clusts'] = [c.detach() for c in clusts]
             result['clust_shapes'] = clust_shapes
 
-        # Save the graph dictionary
-        result.update(graph2)
+        result.update(graph)
+        result.update({'iter_used': self.n_iter, 'filter_index': index})
+        if segmentation_iter1 is not None:
+            result['segmentation_iter1'] = segmentation_iter1
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
