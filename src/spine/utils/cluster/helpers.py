@@ -205,136 +205,235 @@ def tokens_to_sparse_on_parents(
     # Reuse the same coordinates/CM so row order matches parent indices exactly.
     return result
 
+@torch.no_grad()
+def compute_node_confidence(graph, num_shapes: int) -> torch.Tensor:
+    """Compute per-voxel clustering confidence from edge probabilities.
+
+    For each voxel, confidence is the mean over all its graph edges of
+    how far each edge score is from the decision boundary (0.5):
+    ``confidence_i = mean_e( |edge_prob_e - 0.5| * 2 )``
+
+    This maps to [0, 1]:  0 means every edge is maximally uncertain
+    (score = 0.5, i.e. random / early training), 1 means every edge is
+    fully decided (score = 0 or 1, i.e. confident clustering).
+
+    Parameters
+    ----------
+    graph : dict
+        Output of ClusterGraphConstructor.__call__, containing at minimum
+        ``edge_prob`` (TensorBatch), ``edge_index`` (TensorBatch),
+        ``node_clusts`` (IndexBatch), ``edge_clusts`` (IndexBatch), and
+        ``node_pred`` (TensorBatch).
+    num_shapes : int
+        Number of semantic shapes (= len(constructor.shapes)).
+
+    Returns
+    -------
+    torch.Tensor
+        (N_filtered,) float tensor of per-voxel confidence in [0, 1].
+        Voxels with no edges (isolated or from empty shapes) get 0.
+    """
+    edge_prob_flat  = graph['edge_prob'].tensor   # (E_total,)
+    edge_index_flat = graph['edge_index'].tensor  # (E_total, 2) local per-shape indices
+    node_clusts     = graph['node_clusts']        # IndexBatch: [b][s] → local node indices
+    edge_clusts     = graph['edge_clusts']        # IndexBatch: [b][s] → local edge indices
+
+    num_nodes = graph['node_pred'].tensor.shape[0]
+    device    = edge_prob_flat.device
+
+    conf_sum = torch.zeros(num_nodes, device=device)
+    conf_cnt = torch.zeros(num_nodes, device=device)
+
+    for b in range(node_clusts.batch_size):
+        # IndexBatch.__getitem__ strips the stored offset, so add it back to
+        # get indices into the global flat tensors.
+        node_off = int(node_clusts.offsets[b])
+        edge_off = int(edge_clusts.offsets[b])
+
+        for s in range(num_shapes):
+            local_node_idx = node_clusts[b][s]  # (N_bs,) local to batch b
+            local_edge_idx = edge_clusts[b][s]  # (E_bs,) local to batch b
+            if local_edge_idx.numel() == 0:
+                continue
+
+            global_edge_idx = local_edge_idx + edge_off   # index into edge_index_flat
+            ep        = edge_prob_flat[global_edge_idx]    # (E_bs,)
+            edge_conf = (ep - 0.5).abs().mul_(2)           # [0, 1]
+
+            local_ei = edge_index_flat[global_edge_idx]    # (E_bs, 2) per-shape node idx
+            # Map per-shape local node index → global node index in conf_sum
+            src_g = local_node_idx[local_ei[:, 0]] + node_off
+            dst_g = local_node_idx[local_ei[:, 1]] + node_off
+
+            conf_sum.scatter_add_(0, src_g, edge_conf)
+            conf_sum.scatter_add_(0, dst_g, edge_conf)
+            conf_cnt.scatter_add_(0, src_g, torch.ones_like(edge_conf))
+            conf_cnt.scatter_add_(0, dst_g, torch.ones_like(edge_conf))
+
+    return conf_sum.div_(conf_cnt.clamp_(min=1e-8))
+
+
 def mask_cluster_id(
     x_in: ME.SparseTensor,
     cluster_id: torch.Tensor,
+    confidence: torch.Tensor = None,
     mode: str = "in_cluster"
 ):
-    """
-        Create attention mask from cluster assignments.
+    """Create attention mask from cluster assignments.
 
-        Args:
-            x_in: ME.SparseTensor (N, C) - input features
-            cluster_id: (N,) - cluster assignment for each voxel (-1 for noise)
-            mode: str - type of mask to create:
-                - 'in_cluster': attend only within same cluster
-                - 'boundary': attend to cluster boundary regions
+    Args:
+        x_in: ME.SparseTensor (N, C) - input features
+        cluster_id: (N,) - cluster assignment for each voxel (-1 for noise)
+        confidence: (N,) optional per-voxel confidence in [0, 1].
+            When provided, cross-cluster suppression is scaled by
+            ``min(conf_i, conf_j)`` instead of being hard -inf.
+            Low confidence → near-uniform attention.
+            High confidence → sharp within-cluster masking.
+        mode: str - type of mask to create:
+            - 'in_cluster': attend only within same cluster
+            - 'boundary': attend to cluster boundary regions
 
-        Returns:
-            attention_mask: mask suitable for torch.nn.MultiheadAttention
-                - For 'attn_mask': (B, N, N)
-                - Padded for events in one batch
+    Returns:
+        attention_mask: mask suitable for torch.nn.MultiheadAttention
+            - For 'attn_mask': (B, N, N)
+            - Padded for events in one batch
     """
-    assert x_in.F.shape[0] == cluster_id.shape[0], f"Feature count {x_in.F.shape[0]} != cluster_id count {cluster_id.shape[0]}"
+    assert x_in.F.shape[0] == cluster_id.shape[0], (
+        f"Feature count {x_in.F.shape[0]} != cluster_id count {cluster_id.shape[0]}")
     batch_indices = x_in.C[:, 0]
     unique_batches = torch.unique(batch_indices, sorted=True)
     device = x_in.F.device
 
+    # Return a list of per-event (N_b, N_b) masks rather than a single padded
+    # (B, max_N, max_N) tensor.  The padded form requires O(B * max_N^2) memory
+    # upfront (e.g. 16 events × 14500^2 × 4 B ≈ 13 GiB) even though blocks.py
+    # only ever uses one event's slice at a time.
     masks_list = []
-    #batch_slices = []
-    batch_sizes = []
     for b in unique_batches:
         batch_mask_bool = (batch_indices == b)
         batch_cluster_ids = cluster_id[batch_mask_bool]
-        x_batch_C = x_in.C[batch_mask_bool,1:].float()
+        batch_confidence = confidence[batch_mask_bool] if confidence is not None else None
+        x_batch_C = x_in.C[batch_mask_bool, 1:].float()
         if mode == "in_cluster":
-            mask_b = create_incluster_mask(batch_cluster_ids)
+            mask_b = create_incluster_mask(batch_cluster_ids, confidence=batch_confidence)
         elif mode == "boundary":
-            mask_b = create_boundary_mask(x_batch_C, batch_cluster_ids)
+            mask_b = create_boundary_mask(x_batch_C, batch_cluster_ids,
+                                          confidence=batch_confidence)
             del x_batch_C
         else:
             raise ValueError(f"Unknown mask mode: {mode}")
 
         masks_list.append(mask_b.detach())
-        #batch_slices.append(batch_mask_bool)
-        batch_sizes.append(mask_b.shape[0])
         del mask_b
 
-    B = len(masks_list)
-    max_N = max(batch_sizes)
-    masks = torch.full(
-        (B, max_N, max_N),
-        fill_value = float('-inf'),
-        device = device,
-        dtype=torch.float32
-    )
-    for i, mask in enumerate(masks_list):
-        N = mask.shape[0]
-        masks[i, :N, :N] = mask
-        del mask
+    return masks_list
 
-    del masks_list, batch_sizes
+def create_incluster_mask(cluster_id, confidence=None, mask_scale: float = 15.0):
+    """Build the (N, N) additive attention-bias mask for within-cluster attention.
 
-    torch.cuda.empty_cache()
-    return masks
+    Parameters
+    ----------
+    cluster_id : torch.Tensor
+        (N,) integer cluster assignment; -1 = noise.
+    confidence : torch.Tensor, optional
+        (N,) per-voxel confidence in [0, 1].  When ``None``, the mask is hard:
+        0 for allowed pairs, -inf for blocked pairs.  When provided, blocked
+        pairs receive ``-confidence_ij * mask_scale`` where
+        ``confidence_ij = min(confidence_i, confidence_j)``.
 
-def create_incluster_mask(cluster_id):
+        This means:
+        - confidence → 0 (garbage clusters): mask → 0 everywhere → uniform attention.
+        - confidence → 1 (sharp clusters):   mask → -mask_scale ≈ -inf → hard block.
+    mask_scale : float, default 15.0
+        Magnitude of the soft suppression.  ``exp(-15) ≈ 3e-7``, effectively
+        zero after softmax when confidence = 1.
+    """
     device = cluster_id.device
     N = cluster_id.shape[0]
 
-    mask = torch.full((N, N), float('-inf'), device=device, dtype=torch.float32)
-
-    same_cluster = (cluster_id.unsqueeze(0) == cluster_id.unsqueeze(1))  # (N, N)
-    not_noise = (cluster_id >= 0)  # (N,)
-    both_not_noise = not_noise.unsqueeze(0) & not_noise.unsqueeze(1)  # (N, N)
-
+    same_cluster    = (cluster_id.unsqueeze(0) == cluster_id.unsqueeze(1))  # (N, N)
+    not_noise       = (cluster_id >= 0)
+    both_not_noise  = not_noise.unsqueeze(0) & not_noise.unsqueeze(1)       # (N, N)
     allow_attention = same_cluster & both_not_noise
     allow_attention.diagonal().fill_(True)
 
-    mask[allow_attention] = 0
+    if confidence is None:
+        # Hard binary mask: original behaviour
+        mask = torch.full((N, N), float('-inf'), device=device, dtype=torch.float32)
+        mask[allow_attention] = 0.0
+    else:
+        # Soft mask: cross-cluster suppression scales with joint confidence.
+        # Allowed (same-cluster) pairs are always 0; blocked pairs range
+        # from 0 (uncertain) to -mask_scale (fully confident).
+        conf_ij = torch.minimum(
+            confidence.unsqueeze(1),   # (N, 1)
+            confidence.unsqueeze(0),   # (1, N)
+        )                              # (N, N) — conservative: use the less confident voxel
+        mask = torch.zeros((N, N), device=device, dtype=torch.float32)
+        blocked = (~allow_attention) & both_not_noise
+        mask[blocked] = -(conf_ij[blocked] * mask_scale)
+        del conf_ij
 
     del same_cluster, not_noise, both_not_noise, allow_attention
     return mask
 
-def create_boundary_mask(coords, cluster_id, neighbor_r = 5):
+def create_boundary_mask(coords, cluster_id, neighbor_r=5,
+                         confidence=None, mask_scale: float = 15.0):
+    """Build the (N, N) additive attention-bias mask for boundary-aware attention.
+
+    Interior voxels attend only within their cluster; boundary voxels also
+    attend to any voxel within ``neighbor_r`` (to probe cross-cluster regions).
+
+    Parameters
+    ----------
+    coords : torch.Tensor
+        (N, 3) voxel coordinates.
+    cluster_id : torch.Tensor
+        (N,) integer cluster assignment; -1 = noise.
+    neighbor_r : float, default 5
+        Radius within which boundary voxels may attend cross-cluster.
+    confidence : torch.Tensor, optional
+        (N,) per-voxel confidence in [0, 1].  When provided, suppressed pairs
+        (those that are neither same-cluster nor boundary-proximal) receive
+        ``-min(conf_i, conf_j) * mask_scale`` instead of hard -inf.
+        Low confidence → near-uniform attention; high confidence → hard block.
+    mask_scale : float, default 15.0
+        Magnitude of soft suppression.  See ``create_incluster_mask``.
+    """
     device = cluster_id.device
     N = cluster_id.shape[0]
     dist_matrix = torch.cdist(coords, coords)  # (N, N)
     within_radius = (dist_matrix <= neighbor_r)
 
     is_boundary = detect_boundary_vox(dist_matrix, cluster_id, neighbor_r)
-    #is_boundary = detect_boundary_vox_efficient(coords, cluster_id, neighbor_r)
 
-    same_cluster = (cluster_id.unsqueeze(0) == cluster_id.unsqueeze(1))
-    not_noise = (cluster_id >= 0)  # (N,)
-    both_not_noise = not_noise.unsqueeze(0) & not_noise.unsqueeze(1)  # (N, N)
-    # For each voxel:
-    # - If boundary: attend to nearby voxels
-    # - If interior: attend only to same cluster
+    same_cluster   = (cluster_id.unsqueeze(0) == cluster_id.unsqueeze(1))
+    not_noise      = (cluster_id >= 0)
+    both_not_noise = not_noise.unsqueeze(0) & not_noise.unsqueeze(1)
+
     is_boundary_i = is_boundary.unsqueeze(1)  # (N, 1)
     is_boundary_j = is_boundary.unsqueeze(0)  # (1, N)
 
-    '''
-    allow_attention = same_cluster.clone()    
-    if needs_distance.any():
-        boundary_idx = torch.where(is_boundary)[0]
-        if len(boundary_idx) > 0:
-            coords_boundary = coords[boundary_idx]
-            # Much smaller distance matrix!
-            dist_boundary = torch.cdist(coords_boundary, coords)
-            within_radius = (dist_boundary <= neighbor_r)
-
-            # Update attention for boundary voxels
-            allow_attention[boundary_idx] = allow_attention[boundary_idx] | within_radius
-
-            del coords_boundary, dist_boundary, within_radius, boundary_idx
-    '''
-
-
     allow_attention = (
-            # Both are boundaries and within radius
-            ((is_boundary_i | is_boundary_j) & within_radius) |
-            # Or same cluster (standard within-cluster attention)
-            (same_cluster)
+        ((is_boundary_i | is_boundary_j) & within_radius) | same_cluster
     )
-    # Always allow self-attention
     allow_attention = allow_attention & both_not_noise
     allow_attention.diagonal().fill_(True)
 
-    mask = torch.zeros((N, N), device=device, dtype=torch.float32)
-    mask[~allow_attention] = float('-inf')
+    if confidence is None:
+        mask = torch.zeros((N, N), device=device, dtype=torch.float32)
+        mask[~allow_attention] = float('-inf')
+    else:
+        conf_ij = torch.minimum(
+            confidence.unsqueeze(1),
+            confidence.unsqueeze(0),
+        )  # (N, N)
+        mask = torch.zeros((N, N), device=device, dtype=torch.float32)
+        blocked = (~allow_attention) & both_not_noise
+        mask[blocked] = -(conf_ij[blocked] * mask_scale)
+        del conf_ij
 
-    del same_cluster, not_noise, both_not_noise, allow_attention #, needs_distance
+    del same_cluster, not_noise, both_not_noise, allow_attention
     del is_boundary_i, is_boundary_j, is_boundary
 
     return mask

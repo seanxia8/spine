@@ -15,11 +15,71 @@ from spine.constants import CLUST_COL, SHAPE_COL
 from spine.constants.factory import enum_factory
 from spine.data import IndexBatch, ObjectList, TensorBatch
 from spine.utils.gnn.cluster import form_clusters
-from spine.utils.metrics import ari, eff, pur
+from spine.utils.metrics import ari, eff, pur, sbd
 
 from .ccc import ConnectedComponentClusterer
 
 __all__ = ["ClusterGraphConstructor"]
+
+
+def radius_topk_graph(x, k, r, batch=None, loop=False, max_search_neighbors=None):
+    """The k closest neighbors within radius r -- nothing beyond r, ever.
+
+    Unlike `radius_graph`'s own `max_num_neighbors` cap, which (per the
+    torch_cluster docstring) picks an arbitrary/random subset once a node
+    has more candidates than the cap, this explicitly sorts every candidate
+    within r by distance and keeps the k closest. A node with fewer than k
+    true neighbors within r simply ends up with fewer than k edges -- no
+    padding from outside the radius is ever considered.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        (N, D) Point coordinates
+    k : int
+        Maximum number of neighbors to keep per node
+    r : float
+        Radius within which candidates are considered at all
+    batch : torch.Tensor, optional
+        (N) Batch index per point
+    loop : bool, default False
+        If `True`, include self-loops
+    max_search_neighbors : int, optional
+        Candidate cap passed to the underlying radius search (not the final
+        per-node edge count). Must be large enough to capture the true local
+        density, or the closest-k selection below inherits the same
+        random-truncation issue one level removed. Defaults to
+        ``max(10 * k, 64)``.
+
+    Returns
+    -------
+    torch.Tensor
+        (2, E) Edge index of the k-nearest-within-r graph
+    """
+    search_cap = max_search_neighbors or max(10 * k, 64)
+    edge_index = radius_graph(
+        x, r, batch=batch, loop=loop, max_num_neighbors=search_cap)
+    if edge_index.shape[1] == 0:
+        return edge_index
+
+    src, dst = edge_index
+    dist = (x[src] - x[dst]).norm(dim=1)
+
+    # Sort by distance, then a *stable* sort by source node: this groups
+    # edges by source while preserving the ascending-distance order within
+    # each group.
+    order = torch.argsort(dist)
+    order = order[torch.argsort(src[order], stable=True)]
+    src_grouped = src[order]
+
+    # Rank of each edge within its source node's group (0 = closest),
+    # computed without any Python-level loop over groups.
+    _, counts = torch.unique_consecutive(src_grouped, return_counts=True)
+    group_starts = torch.cumsum(counts, 0) - counts
+    rank = (torch.arange(src_grouped.shape[0], device=x.device)
+            - torch.repeat_interleave(group_starts, counts))
+
+    return edge_index[:, order[rank < k]]
 
 
 class ClusterGraphConstructor:
@@ -33,12 +93,15 @@ class ClusterGraphConstructor:
         shapes,
         edge_threshold,
         kernel_fn=None,
+        edge_proj=None,
+        detach_edge_features=False,
         min_size=0,
         invert=True,
         label_edges=False,
         target_col=CLUST_COL,
         training=False,
         orphan=None,
+        union_graph=None,
     ):
         """Initialize the cluster graph constructor.
 
@@ -66,6 +129,25 @@ class ClusterGraphConstructor:
             If `True`, this constructor is being used at train time
         orphan : dict, optional
             Orphan clustering configuration dictionary
+        union_graph : dict, optional
+            When provided, completely replaces ``graph`` for refinement
+            iterations (k >= 1) once the feature-graph warmup is over.
+            Must contain two sub-configs:
+              - ``spatial``: kNN/radius config for the coordinate-space edges
+              - ``feature``: kNN/radius config for the feature-space edges
+            The two edge sets are unioned and deduplicated before kernel
+            scoring.  ``graph`` is only used during warmup (or if
+            ``union_graph`` is absent), so there is no redundant graph build.
+            Example::
+
+                union_graph:
+                  spatial:
+                    name: knn
+                    k: 5
+                  feature:
+                    name: knn
+                    k: 5
+                    cosine: true
 
         Raises
         ------
@@ -80,27 +162,47 @@ class ClusterGraphConstructor:
         self.min_size = min_size
         self.invert = invert
         self.label_edges = label_edges
-        self.kernel_fn = kernel_fn
+        self.kernel_fn          = kernel_fn
+        self.edge_proj          = edge_proj
+        self.detach_edge_features = detach_edge_features
         self.target_col = target_col
 
-        # Partially instantiate the graph constructor functions
-        assert "name" in graph, "Must provide the graph constructor function name."
-
-        name = graph.pop("name")
-        if name == "knn":
-            self.graph_fn = partial(knn_graph, **graph)
-        elif name == "radius":
-            self.graph_fn = partial(radius_graph, **graph)
-        else:
+        def _build_graph_fn(cfg, label):
+            name = cfg.get("name")
+            assert name, f"Must provide 'name' in {label} config."
+            kwargs = {k: v for k, v in cfg.items() if k != "name"}
+            if name == "knn":
+                return partial(knn_graph, **kwargs)
+            elif name == "radius":
+                return partial(radius_graph, **kwargs)
+            elif name == "radius_topk":
+                return partial(radius_topk_graph, **kwargs)
             raise ValueError(
-                f"Requested graph construction mode ('{name}') is not "
-                "recognized. Must be one of 'knn' or 'radius'"
+                f"{label} graph name '{name}' not recognised. "
+                "Must be 'knn', 'radius', or 'radius_topk'."
             )
+
+        # Base graph — used during warmup or when union_graph is absent
+        self.graph_fn = _build_graph_fn(graph, "graph")
+
+        # Union graph — two sub-fns built from spatial + feature sub-configs.
+        # When active it completely replaces graph_fn; no redundant build.
+        self.union_spatial_fn = None
+        self.union_feature_fn = None
+        if union_graph is not None:
+            assert "spatial" in union_graph and "feature" in union_graph, (
+                "union_graph must contain both 'spatial' and 'feature' sub-configs."
+            )
+            self.union_spatial_fn = _build_graph_fn(union_graph["spatial"],
+                                                     "union_graph.spatial")
+            self.union_feature_fn = _build_graph_fn(union_graph["feature"],
+                                                     "union_graph.feature")
 
         # Initialize the cluster assignment class
         self.ccc = ConnectedComponentClusterer(min_size, orphan)
 
-    def __call__(self, coords, features, seg_label, clust_label=None):
+    def __call__(self, coords, features, seg_label, clust_label=None,
+                 use_union_graph=False):
         """Constructs graphs for all the entries in a batch, one per shape.
 
         Parameters
@@ -115,6 +217,8 @@ class ClusterGraphConstructor:
         clust_label : TensorBatch, optional
             (N, 1 + D + N_c) Tensor of cluster labels
             - N_c is is the number of cluster labels
+        use_union_graph : bool, default False
+            If `True`, uses the union_graph to construct the graph
         """
         # If edge labeling is required, make sure clust_label is provided
         assert (
@@ -129,7 +233,8 @@ class ClusterGraphConstructor:
             # Build graphs (one per semantic type)
             clust_label_b = clust_label[b] if clust_label is not None else None
             graphs_b, edge_count = self.build_graph(
-                coords[b], features[b], seg_label[b], clust_label_b
+                coords[b], features[b], seg_label[b], clust_label_b,
+                use_union_graph=use_union_graph,
             )
 
             # Append the output
@@ -171,10 +276,15 @@ class ClusterGraphConstructor:
         graph["node_shapes"] = TensorBatch(
             seg_label.tensor[:, SHAPE_COL], seg_label.counts
         )
+        if clust_label is not None:
+            graph["node_label"] = TensorBatch(
+                clust_label.tensor[:, self.target_col], clust_label.counts
+            )
 
         return graph
 
-    def build_graph(self, coords, features, seg_label, clust_label=None):
+    def build_graph(self, coords, features, seg_label, clust_label=None,
+                    use_union_graph=False):
         """Construct a graph for a single batch id and semantic class that
         will be used for connected components clustering.
 
@@ -192,7 +302,8 @@ class ClusterGraphConstructor:
         clust_label : torch.Tensor, optional
             (N, 1 + D + N_c) Tensor of cluster labels
             - N_c is is the number of cluster labels
-
+        use_union_graph : bool, default False
+            If `True`, uses the feature-space kNN graph to construct the graph
         Returns
         -------
         Dict[str, torch.Tensor]
@@ -226,17 +337,47 @@ class ClusterGraphConstructor:
                     )
                 continue
 
-            # Make the graph edge index
-            edge_index = self.graph_fn(coords[seg_index])
+            coords_s = coords[seg_index]
+            if use_union_graph and self.union_spatial_fn is not None:
+                # Post-warmup union mode: build spatial + feature entirely from
+                # union_graph sub-configs.  graph_fn is NOT called — no waste.
+                edge_index = self.union_spatial_fn(coords_s)
+                with torch.no_grad():
+                    feat_ei = self.union_feature_fn(features[seg_index])
+                edge_index = torch.unique(
+                    torch.cat([edge_index, feat_ei], dim=1), dim=1)
+            else:
+                # Warmup or no union_graph configured: base spatial kNN only
+                edge_index = self.graph_fn(coords_s)
+
             graph["edge_clusts"].append(
                 edge_count + torch.arange(edge_index.shape[1], device=coords.device)
             )
             edge_count += edge_index.shape[1]
 
-            # Produce edge predictions
+            # Spatial distance per edge — new information for the kernel since it
+            # only sees feature vectors.  For pure spatial-kNN edges this is
+            # bounded by the kNN radius; for long-range feature-kNN-only edges it
+            # can be much larger, letting the kernel calibrate its confidence.
+            spatial_dist = (
+                coords_s[edge_index[0]] - coords_s[edge_index[1]]
+            ).norm(dim=1).detach()
+
+            # Produce edge predictions.
+            # detach_edge_features stops backbone gradient independently of
+            # whether edge_proj is set — the two are orthogonal controls:
+            #   detach=True,  proj=None : kernel operates on detached raw features
+            #   detach=True,  proj=set  : proj adapts on detached features
+            #   detach=False, proj=set  : proj AND backbone both see edge loss
+            #   detach=False, proj=None : current default behaviour
             features_s = features[seg_index]
+            if self.detach_edge_features:
+                features_s = features_s.detach()
+            if self.edge_proj is not None:
+                features_s = self.edge_proj(features_s)
             edge_attr = self.kernel_fn(
-                features_s[edge_index[0]], features_s[edge_index[1]]
+                features_s[edge_index[0]], features_s[edge_index[1]],
+                spatial_dist=spatial_dist,
             )
 
             # Append
@@ -353,13 +494,14 @@ class ClusterGraphConstructor:
         """
         # No gradients through this evaluation
         result = defaultdict(list)
-        metrics = {"ari": ari, "purity": pur, "efficiency": eff}
+        metrics = {"ari": ari, "purity": pur, "efficiency": eff, "sbd": sbd}
+        batch_size = graph["node_coords"].batch_size
         with torch.no_grad():
             # Loop over the batches
             for b in range(batch_size):
-                # Get the node predictions and labels
-                node_label_b = graph["node_label"][b]
-                node_pred_b = graph["node_pred"][b]
+                # Get the node predictions and labels (convert to numpy for numba metrics)
+                node_label_b = graph["node_label"][b].cpu().numpy().astype(np.int64)
+                node_pred_b = graph["node_pred"][b].cpu().numpy().astype(np.int64)
 
                 # Compute shape-agnostic metrics
                 for m, metric in metrics.items():
@@ -368,14 +510,16 @@ class ClusterGraphConstructor:
                 # Loop over the semantic types
                 for s, shape in enumerate(self.shapes):
                     # Narrow down the predictions and labels to this shape
-                    node_index = graph["node_clusts"][b][s]
+                    node_index = graph["node_clusts"][b][s].cpu().numpy()
                     node_label_b_s = node_label_b[node_index]
                     node_pred_b_s = node_pred_b[node_index]
 
-                    # If there are no points of this type, append default values
+                    # If there are no points of this type, skip metric
+                    # computation (absent class — not a failure).
                     if not len(node_index):
                         for m in metrics:
-                            result[f"{m}_{shape}"].append(1.0)
+                            result[f"{m}_{shape}"].append(float('nan'))
+                        continue
 
                     # Otherwise, compute the metrics
                     for m, metric in metrics.items():
@@ -383,10 +527,12 @@ class ClusterGraphConstructor:
                             metric(node_pred_b_s, node_label_b_s)
                         )
 
-        # Compute batch averaged metrics, return
+        # Compute batch averaged metrics, return.
+        # Use nanmean so that absent-class entries (nan) are excluded rather
+        # than poisoning the average; all-nan → nan (logged but filtered by wandb).
         if mean:
             for key, value in result.items():
-                result[key] = np.mean(value)
+                result[key] = np.nanmean(value)
 
         return result
 

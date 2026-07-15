@@ -60,9 +60,10 @@ class AttnGraphSPICEEmbedder(nn.Module):
 
 
     def process_model_config(self, predict_semantics=False, num_classes=None,
-                             coord_conv=True, covariance_mode='softplus', 
+                             coord_conv=True, covariance_mode='softplus',
                              occupancy_mode='softplus', feature_embedding_dim=16,
-                             spatial_embedding_dim=3, use_raw_features=False):
+                             spatial_embedding_dim=3, use_raw_features=False,
+                             detach_edge_features=False):
         """Process the embedding parameters.
 
         Parameters
@@ -88,8 +89,12 @@ class AttnGraphSPICEEmbedder(nn.Module):
         # Store basic properties
         self.num_classes = num_classes
         self.coord_conv = coord_conv
-        self.predict_semantics = predict_semantics
-        self.use_raw_features = use_raw_features
+        self.predict_semantics  = predict_semantics
+        self.use_raw_features   = use_raw_features
+        # detach_edge_features: stop backbone gradient before edge-score computation.
+        # Only applies when use_raw_features=False (hypergraph path); the raw-features
+        # path is handled in build_graph via ClusterGraphConstructor.detach_edge_features.
+        self.detach_hypergraph  = detach_edge_features and not use_raw_features
         self.covariance_mode = covariance_mode
         self.occupancy_mode = occupancy_mode
 
@@ -117,8 +122,21 @@ class AttnGraphSPICEEmbedder(nn.Module):
                     f"Occupancy mode not recognized: {self.covariance_mode}")
 
     from typing import Optional
-    def forward(self, data, *, cluster_id_full:Optional[torch.Tensor]=None):
+    def forward(self, data, *, cluster_id_full: Optional[torch.Tensor] = None,
+                node_confidence: Optional[torch.Tensor] = None):
         """Compute the embeddings for one batch of data.
+
+        Parameters
+        ----------
+        data : TensorBatch
+            Input voxel/value batch.
+        cluster_id_full : torch.Tensor, optional
+            (N,) integer cluster assignment from the previous iteration.
+            Drives the attention mask in the decoder.
+        node_confidence : torch.Tensor, optional
+            (N,) per-voxel clustering confidence in [0, 1].
+            When provided, cross-cluster suppression in the attention mask is
+            scaled by confidence rather than being a hard -inf block.
         """
         # Build an input feature tensor
         coords = data.tensor[:, :VALUE_COL]
@@ -136,65 +154,68 @@ class AttnGraphSPICEEmbedder(nn.Module):
         enc_out = self.encoder(x_in)
         x_bn = enc_out["final_tensor"]
         skips = enc_out["encoder_tensors"]
-        dec1, _ = self.decoder(x_bn, encoder_tensors=skips, cluster_ids=None)
-        x_full_1 = dec1[-1]
-        output_features = x_full_1.F
         coords = TensorBatch(coords, data.counts, coord_cols=COORD_COLS)
-        features = TensorBatch(output_features, data.counts)
-
-        result = {
-            'coordinates': coords,
-            'features': features,
-        }
-        #'first_path_xfull': x_full_1,
-        #'final_tensor': x_bn,
-        #'decoder_tensors': dec1,
-        #'encoder_tensors': skips,
-
-        # If requested, add a semantic prediction to the output
-        if self.predict_semantics:
-            # Segmentation layer
-            segmentation = self.out_seg(output_features)
-            # Append results
-            result['segmentation_iter1'] = TensorBatch(segmentation, data.counts)
 
         if cluster_id_full is None or not self.enable_attention:
-            #del x_bn, skips, x_in, enc_out
+            # Unconditional pass: no cluster conditioning available or attention
+            # disabled. Run a single decoder pass and return.
+            dec1, _ = self.decoder(x_bn, encoder_tensors=skips, cluster_ids=None)
+            output_features = dec1[-1].F
+            features = TensorBatch(output_features, data.counts)
+            result = {'coordinates': coords, 'features': features}
+            if not self.use_raw_features:
+                # Produce hypergraph_features so _get_features() works regardless
+                # of which pass (first or attention) calls it.
+                proj_feats = output_features.detach() if self.detach_hypergraph \
+                             else output_features
+                spatial_embeddings = self.out_spatial(proj_feats)
+                feature_embeddings = self.out_feature(proj_feats)
+                out = self.out_cov(proj_feats); covariance = self.cov_func(out)
+                out = self.out_occupancy(proj_feats); occupancy = self.occ_func(out)
+                hypergraph_features = torch.cat(
+                    [spatial_embeddings, feature_embeddings, covariance, occupancy], dim=1)
+                result['hypergraph_features'] = TensorBatch(hypergraph_features, data.counts)
+            if self.predict_semantics:
+                segmentation = self.out_seg(output_features)
+                result['segmentation_iter0'] = TensorBatch(segmentation, data.counts)
             return result
 
-        #parent_of = build_parent_of_from_kernel_map(parent_st=x_bn, child_st=x_full_1)
-
-        #tokens, topk_cid, topk_w = build_cluster_token_topk(
-        #    parent_of=parent_of,
-        #    child_cluster_id=cluster_id_full,
-        #    child_feats=x_full_1.F,
-        #    n_parent=x_bn.F.shape[0],
-        #    K=K,
-        #)
-        #bn_tokens = tokens_to_sparse_on_parents(x_bn, tokens)
-        #bn_tokens = mask_cluster_id(x_full_1, cluster_id_full)
-        dec2, _attn = self.decoder(x_bn, encoder_tensors=skips, cluster_ids=cluster_id_full)
-        x_full_2 = dec2[-1]
-        output_features = x_full_2.F
-        #del x_full_1, dec1, x_full_2, dec2, x_bn, skips, x_in, enc_out
-        # Convert the output to tensor batches
+        # Attention-conditioned pass: skip dec1 entirely — its output is not
+        # used when cluster_id_full is provided, and omitting it frees the
+        # decoder activations before the memory-intensive attention softmax.
+        dec2, _attn = self.decoder(x_bn, encoder_tensors=skips, cluster_ids=cluster_id_full,
+                                   node_confidence=node_confidence)
+        output_features = dec2[-1].F
         features = TensorBatch(output_features, data.counts)
-        result.update({"features": features})
+        result = {'coordinates': coords, 'features': features}
+
+        # Mean entropy across all available attention heads and layers.
+        # _attn: list-of-lists [layer][head] of detached tensors; last dim is
+        # the attended sequence treated as a probability distribution.
+        entropies = [-(aw.float().clamp(min=1e-8).log()
+                       * aw.float().clamp(min=1e-8)).sum(-1).mean().item()
+                     for layer_attn in _attn
+                     for aw in layer_attn if aw is not None]
+        result['attn_entropy'] = (sum(entropies) / len(entropies)
+                                  if entropies else float('nan'))
 
         # If requested, pass the raw output features through final layers
         if not self.use_raw_features:
+            # Optionally stop gradient to backbone before the projection heads.
+            proj_feats = output_features.detach() if self.detach_hypergraph \
+                         else output_features
             # Spatial Embeddings (offset by the normalized coordinates)
-            spatial_embeddings = self.out_spatial(output_features)
+            spatial_embeddings = self.out_spatial(proj_feats)
 
             # Feature Embeddings
-            feature_embeddings = self.out_feature(output_features)
+            feature_embeddings = self.out_feature(proj_feats)
 
             # Covariance
-            out = self.out_cov(output_features)
+            out = self.out_cov(proj_feats)
             covariance = self.cov_func(out)
 
             # Occupancy
-            out = self.out_occupancy(output_features)
+            out = self.out_occupancy(proj_feats)
             occupancy = self.occ_func(out)
 
             # Bundle the features together
@@ -216,7 +237,7 @@ class AttnGraphSPICEEmbedder(nn.Module):
                     'feature_embeddings': feature_embeddings,
                     'covariance': covariance,
                     'occupancy': occupancy,
-                    'hypergraph_features': hypergraph_features
+                    'hypergraph_features': TensorBatch(hypergraph_features, data.counts)
             })
 
         # If requested, add a semantic prediction to the output
@@ -225,7 +246,7 @@ class AttnGraphSPICEEmbedder(nn.Module):
             segmentation = self.out_seg(output_features)
 
             # Append results
-            result['segmentation'] = TensorBatch(segmentation, data.counts)
+            result['segmentation_iter_last'] = TensorBatch(segmentation, data.counts)
             #result['attention_heatmap'] = TensorBatch(_attn, data.counts)
 
         return result

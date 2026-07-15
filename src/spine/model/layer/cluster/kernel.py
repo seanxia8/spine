@@ -92,7 +92,7 @@ class DefaultKernel(nn.Module):
 
         return pvec
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, **kwargs):
         """Computes the kernel edge score of ll node pairs in the graph.
 
         This kernel expectes a set of (3 + N_f + 2 + 1) features per node:
@@ -212,7 +212,7 @@ class MixedKernel(DefaultKernel):
 
         return pvec
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, **kwargs):
         """Computes the kernel edge score of all node pairs in the graph.
 
         This kernel expectes a set of (3 + 3 + 3 + N_f + 2 + 3 + 1 + 1)
@@ -271,7 +271,8 @@ class BilinearKernel(nn.Module):
 
     name = "bilinear"
 
-    def __init__(self, num_features, bias=False):
+    def __init__(self, num_features, bias=False, use_spatial_dist=False,
+                 bilinear_out=1, mlp_hidden=None, spatial_dist_scale=1.0):
         """Initializes the kernel.
 
         Parameters
@@ -280,17 +281,62 @@ class BilinearKernel(nn.Module):
             Number of dimensions in feature embedding space
         bias : bool, default False
             If `True`, allows for an overall bias in the bilinear layer
+        use_spatial_dist : bool, default False
+            If `True`, the 3D spatial distance between the two nodes is
+            concatenated to the bilinear outputs before the MLP head.  This
+            lets the kernel distinguish local spatial-kNN edges (small dist)
+            from long-range feature-kNN-only edges (large dist).
+            Requires ``spatial_dist`` to be passed at call time.
+        bilinear_out : int, default 1
+            Number of parallel bilinear outputs.  With 1 (default) the kernel
+            is a single bilinear form and behaves identically to before.
+            With K > 1 the kernel computes K bilinear forms simultaneously,
+            giving K different pairwise comparison modes whose gradients shape
+            the feature space in K directions per step.  A small nonlinear MLP
+            head then combines them (+ optional spatial_dist) into the final
+            edge logit.
+        mlp_hidden : int, optional
+            Hidden width of the MLP head used when ``bilinear_out > 1`` or
+            ``use_spatial_dist=True``.  Defaults to
+            ``max(2 * bilinear_out, 32)``.
+        spatial_dist_scale : float, default 1.0
+            Denominator used to normalise ``spatial_dist`` before applying
+            ``log1p``: the kernel receives ``log1p(spatial_dist / scale)``.
+            Set to the typical edge length (e.g. the kNN neighbourhood radius)
+            so that near-range edges map to ~log1p(1)≈0.69 and far edges are
+            compressed into a bounded range.  Default 1.0 preserves old
+            behaviour (no scaling before log1p).
         """
         # Initialize the parent class
         super().__init__()
 
-        # Initialize the bilinear layer
-        self.bilin = nn.Bilinear(num_features, num_features, 1, bias=bias)
-
-        # Store parameter
         self.num_features = num_features
+        self.use_spatial_dist = use_spatial_dist
+        self.spatial_dist_scale = spatial_dist_scale
 
-    def forward(self, x1, x2):
+        # K parallel bilinear forms: (E, N_f) x (E, N_f) → (E, K)
+        self.bilin = nn.Bilinear(num_features, num_features, bilinear_out, bias=bias)
+
+        # Scalar additive weight for spatial_dist when bilinear_out=1.
+        # Keeps the simple additive form: logit = bilinear + w * dist.
+        self.dist_weight = None
+        self.head = None
+        if bilinear_out == 1:
+            if use_spatial_dist:
+                # Additive: logit = bilinear(f_i,f_j) + w * spatial_dist
+                self.dist_weight = nn.Linear(1, 1, bias=False)
+            # else: raw bilinear scalar, nothing extra needed
+        else:
+            # K>1: MLP head combines K bilinear outputs + optional spatial_dist
+            mlp_in = bilinear_out + (1 if use_spatial_dist else 0)
+            hidden = mlp_hidden if mlp_hidden is not None else max(2 * bilinear_out, 32)
+            self.head = nn.Sequential(
+                nn.Linear(mlp_in, hidden),
+                nn.ELU(),
+                nn.Linear(hidden, 1),
+            )
+
+    def forward(self, x1, x2, spatial_dist=None):
         """Computes the kernel edge score of all node pairs in the graph.
 
         Parameters
@@ -298,14 +344,29 @@ class BilinearKernel(nn.Module):
         x1 : torch.Tensor
             (E, N_f) Features of the source nodes
         x2 : torch.Tensor
-            (E, N_f) Features of the targer nodes
+            (E, N_f) Features of the target nodes
+        spatial_dist : torch.Tensor, optional
+            (E,) 3D Euclidean distance between the two nodes in voxel units.
+            Only used when ``use_spatial_dist=True``.
         """
-        # Check on input size, pass through the bilinear layer
         assert (
             x1.shape[1] == x2.shape[1] == self.num_features
         ), "The feature vector is not of the expected shape."
 
-        return self.bilin(x1, x2)
+        out = self.bilin(x1, x2)  # (E, bilinear_out)
+
+        if self.use_spatial_dist and spatial_dist is not None:
+            dist_norm = torch.log1p(spatial_dist / self.spatial_dist_scale).unsqueeze(1)
+            if self.dist_weight is not None:
+                # bilinear_out=1 path: simple additive scalar weight
+                out = out + self.dist_weight(dist_norm)
+            elif self.head is not None:
+                # bilinear_out>1 path: MLP combines K outputs + normalised dist
+                out = self.head(torch.cat([out, dist_norm], dim=1))
+        elif self.head is not None:
+            out = self.head(out)
+
+        return out
 
 
 class MLPKernel(nn.Module):
@@ -342,7 +403,7 @@ class MLPKernel(nn.Module):
         # Initialize the final linear layer
         self.lin = nn.Linear(2 * self.mlp.feature_size, 1, bias=bias)
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, **kwargs):
         """Computes the kernel edge score of all node pairs in the graph.
 
         Parameters
@@ -350,7 +411,7 @@ class MLPKernel(nn.Module):
         x1 : torch.Tensor
             (E, N_f) Features of the source nodes
         x2 : torch.Tensor
-            (E, N_f) Features of the targer nodes
+            (E, N_f) Features of the target nodes
         """
         # Pass the node features through the MLP
         f1 = self.mlp(x1)

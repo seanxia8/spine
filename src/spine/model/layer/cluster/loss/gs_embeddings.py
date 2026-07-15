@@ -11,7 +11,7 @@ from spine.utils.weighting import get_class_weights
 
 from .misc import *
 
-__all__ = ["NodeEdgeLoss", "EdgeLoss"]
+__all__ = ["NodeEdgeLoss", "EdgeLoss", "ContrastiveLoss"]
 
 
 class GraphSPICEEmbeddingLoss(nn.Module):
@@ -394,6 +394,8 @@ class EdgeLoss(torch.nn.modules.loss._Loss):
         equal_sampling=False,
         min_sample_edges=1000,
         metric="iou",
+        hard_negative_mining=False,
+        hard_negative_keep_easy=0.2,
     ):
         """Initialize the loss function.
 
@@ -409,6 +411,13 @@ class EdgeLoss(torch.nn.modules.loss._Loss):
             If `True`, sample the same number of edges from each label class
         min_sample_edges : int, default 1000
             If sampling evenly, minimum number of edges to sample with replacement
+        hard_negative_mining : bool, default False
+            If `True`, focus the loss on currently mis-predicted edges (edges
+            where the model prediction disagrees with the label) and a random
+            fraction of correctly-predicted edges to avoid catastrophic forgetting.
+        hard_negative_keep_easy : float, default 0.2
+            Fraction of correctly-predicted edges to keep alongside the hard
+            negatives. Only used when hard_negative_mining=True.
         """
         # Initialize the parent class
         super().__init__()
@@ -416,6 +425,8 @@ class EdgeLoss(torch.nn.modules.loss._Loss):
         # Store parameters
         self.invert = invert
         self.balance_loss = balance_loss
+        self.hard_negative_mining   = hard_negative_mining
+        self.hard_negative_keep_easy = hard_negative_keep_easy
         self.equal_sampling = equal_sampling
         self.min_sample_edges = min_sample_edges
 
@@ -492,16 +503,35 @@ class EdgeLoss(torch.nn.modules.loss._Loss):
         """
         # Extract the raw tensors from the batches
         edge_attr = edge_attr.tensor.flatten()
-        edge_pred = (edge_attr > 0.0).long()
         edge_label = edge_label.tensor
+
+        # Apply the invert convention first so that edge_pred, hard mining,
+        # and metrics all operate in the same label space.
+        # With invert=True: 0 = "on" (same cluster, low-logit target),
+        #                   1 = "off" (different cluster, high-logit target).
+        if self.invert:
+            edge_label = torch.logical_not(edge_label).long()
+
+        edge_pred = (edge_attr > 0.0).long()
+
+        # Save full-edge tensors for metrics (accuracy/IoU reported on all edges,
+        # not just the hard-negative subset used for the loss).
+        edge_pred_all  = edge_pred
+        edge_label_all = edge_label
+
+        # Hard negative mining: keep mis-predicted edges + a random fraction of
+        # correct edges.  Applied before equal_sampling so the subset is coherent.
+        if self.hard_negative_mining:
+            wrong = (edge_pred != edge_label)
+            easy  = torch.rand(len(edge_attr), device=edge_attr.device) < self.hard_negative_keep_easy
+            sel   = wrong | easy
+            edge_attr  = edge_attr[sel]
+            edge_label = edge_label[sel]
+            edge_pred  = edge_pred[sel]
 
         # If requested, extract an equal number of samples from scores/labels
         if self.equal_sampling:
             edge_attr, edge_label = self.sample_edges(edge_attr, edge_label)
-
-        # If requested, make off connections the positive label
-        if self.invert:
-            edge_label = torch.logical_not(edge_label).long()
 
         # Apply the loss function
         loss = self.loss_fn(edge_attr, edge_label)
@@ -513,15 +543,80 @@ class EdgeLoss(torch.nn.modules.loss._Loss):
 
         loss = loss.mean()
 
-        # Evaluate the accuracy
-        num_edges = len(edge_pred)
+        # Evaluate the accuracy on ALL edges (not just the hard-negative subset)
+        num_edges = len(edge_pred_all)
         accuracy = 1.0
         if num_edges > 0:
-            accuracy = (edge_pred == edge_label).sum() / num_edges
+            accuracy = (edge_pred_all == edge_label_all).sum() / num_edges
 
         metric = {}
         if self.metric_fn is not None:
-            metric = {self.metric_fn.name: self.metric_fn(edge_pred, edge_label)}
+            metric = {self.metric_fn.name: self.metric_fn(edge_pred_all, edge_label_all)}
 
         # Prepare and return the result dictionary
         return {"loss": loss, "accuracy": accuracy, **metric}
+
+class ContrastiveLoss(torch.nn.modules.loss._Loss):
+    """Contrastive loss function.
+        Computes the contrastive loss between a set of features in the same set of labels and across sets of labels.
+        The loss is computed as the mean of the maximum of the margin and the negative of the features, 
+        and the mean of the maximum of the margin and the negative of the features across sets of labels.
+        The margin is a hyperparameter that controls the strength of the loss.
+        The features are the output of the feature embedding layer.
+        The labels are the output of the node labeling layer.
+    """
+
+    name = "contrastive"
+
+    def __init__(self, margin=1.0, k_pairs=1):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+        self.k_pairs = k_pairs
+
+    @torch.no_grad()
+    def sample_features(self, features, labels, n=256):
+        """Sample triplet indices for the contrastive loss.
+
+        For each of up to ``n`` random anchors, picks one random positive
+        (same cluster) and the ``k_negatives`` nearest cross-cluster
+        embeddings.  Returns (anchor_idx, pos_idx, neg_topk_idx) where
+        neg_topk_idx is a list of 1-D index tensors (length k per anchor).
+        """
+        n = min(n, len(labels))
+        idx = torch.randperm(len(labels), device=labels.device)[:n]
+        anch_list, pos_list, neg_list = [], [], []
+        for i in idx.tolist():
+            lbl = labels[i]
+            pos_pool = (labels == lbl).nonzero(as_tuple=False).squeeze(1)
+            pos_pool = pos_pool[pos_pool != i]
+            neg_pool = (labels != lbl).nonzero(as_tuple=False).squeeze(1)
+            if pos_pool.numel() < 1 or neg_pool.numel() < 1:
+                continue
+            k_pos = min(self.k_pairs, pos_pool.numel())
+            pos_dists = (features[pos_pool] - features[i]).norm(dim=1)
+            top_k_pos = pos_pool[pos_dists.topk(k_pos, largest=False).indices]    
+            neg_dists = (features[neg_pool] - features[i]).norm(dim=1)
+            k_neg = min(self.k_pairs, neg_pool.numel())
+            top_k_neg = neg_pool[neg_dists.topk(k_neg, largest=False).indices]
+            anch_list.append(i)
+            pos_list.append(top_k_pos)
+            neg_list.append(top_k_neg)
+        return anch_list, pos_list, neg_list
+
+    def forward(self, features, labels, n=256):
+        anch_idx, pos_idx, neg_topk = self.sample_features(features, labels, n)
+        if not anch_idx:
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
+        a   = F.normalize(features[anch_idx], dim=1)
+        # Average the k nearest embeddings before normalising.
+        # Averaging in raw feature space before L2-norm acts like a soft
+        # centroid: less sensitive to a single outlier hard negative than
+        # argmin selection, but still biased toward the hard-negative region.
+        pos_avg = torch.stack([features[ki].mean(0) for ki in pos_idx])
+        p_f   = F.normalize(pos_avg,  dim=1)
+        neg_avg = torch.stack([features[ki].mean(0) for ki in neg_topk])
+        n_f = F.normalize(neg_avg, dim=1)
+        return torch.clamp(
+            self.margin + (a - p_f).norm(dim=1) - (a - n_f).norm(dim=1),
+            min=0
+        ).mean()
