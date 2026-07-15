@@ -248,6 +248,7 @@ class CSVWriter:
         # Append to file (no open/close overhead!)
         result_str = ",".join([str(data[k]) for k in self.keys])
         self.file_handle.write(result_str + "\n")
+        self.file_handle.flush()
 
     @staticmethod
     def array_diff(array_x, array_y):

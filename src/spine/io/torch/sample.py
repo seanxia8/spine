@@ -9,6 +9,7 @@ from torch.utils.data.distributed import DistributedSampler
 __all__ = [
     "SequentialBatchSampler",
     "RandomSequenceBatchSampler",
+    "RandomBatchSampler",
     "BootstrapBatchSampler",
 ]
 
@@ -133,6 +134,14 @@ class RandomSequenceBatchSampler(AbstractBatchSampler):
 
         return iter(indices)
 
+class RandomBatchSampler(AbstractBatchSampler):
+    """Samples batches randomly within the dataset."""
+
+    name = "random"
+
+    def __iter__(self):
+        indices = self._random.permutation(self.num_samples)
+        return iter(indices)
 
 class BootstrapBatchSampler(AbstractBatchSampler):
     """Sampler used for bootstrap sampling of the entire dataset.

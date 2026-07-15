@@ -210,6 +210,9 @@ def sbd(truth, pred, batch_ids=None):
     float
         Symmetric best dice value
     """
+    if len(truth) == 0:
+        return -1.0
+
     # Transform labels to be unique across all batch entries
     truth, truth_unique, truth_counts = unique_labels(truth, batch_ids)
     pred, pred_unique, pred_counts = unique_labels(pred, batch_ids)

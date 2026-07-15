@@ -35,6 +35,7 @@ class ModelManager:
         detect_anomaly=False,
         find_unused_parameters=False,
         iter_per_epoch=None,
+        seed=None,
     ):
         """Process the model configuration.
 
@@ -81,6 +82,8 @@ class ModelManager:
         # Save parameters
         self.train = train
         self.to_numpy = to_numpy
+        self.log_grad_conflict = False  # overridden by initialize_train if enabled
+        self.grad_log_step = 50
         self.time_dependant = time_dependent_loss
         self.dtype = getattr(torch, dtype)
         self.distributed = distributed
@@ -114,6 +117,16 @@ class ModelManager:
 
         # Initialize the model network and loss functions
         net_cls, loss_cls = model_factory(name)
+
+        # Re-seed immediately before weight initialization so that backbone
+        # weights are identical across architectures that differ only in
+        # auxiliary modules (e.g. 1-iter vs 2-iter builds ClusterAwareAttn
+        # before the decoder, shifting the RNG for all subsequent init).
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
         try:
             self.net = net_cls(**modules)
             self.net.to(device=self.device, dtype=self.dtype)
@@ -184,7 +197,8 @@ class ModelManager:
 
     def initialize_train(self, optimizer, weight_prefix='snapshot',
                          restore_optimizer=False, save_step=-1, save_epoch=None,
-                         lr_scheduler=None, iter_per_epoch=None, accum_steps=1):
+                         lr_scheduler=None, iter_per_epoch=None, accum_steps=1,
+                         log_grad_conflict=False, grad_log_step=50):
 
         """Initialize the training regimen.
 
@@ -204,6 +218,14 @@ class ModelManager:
             Configuration of the learning rate scheduler
         iter_per_epoch : int, optional
             Number of iterations per epoch (relevant for training)
+        log_grad_conflict : bool, default False
+            If True, compute and log gradient cosine similarity, conflict
+            fraction, and magnitude ratio between the segmentation and
+            clustering loss components every ``grad_log_step`` iterations.
+            Only active during training (requires intact compute graph).
+        grad_log_step : int, default 50
+            How often (in iterations) to compute gradient conflict statistics.
+            More frequent logging increases backward pass overhead.
         """
         # Turn train on
         self.train = True
@@ -213,6 +235,8 @@ class ModelManager:
         self.weight_prefix = weight_prefix
         self.restore_optimizer = restore_optimizer
         self.accum_steps = accum_steps
+        self.log_grad_conflict = log_grad_conflict
+        self.grad_log_step = grad_log_step
 
         # Store the saving parameters
         if save_step is not None and save_epoch is not None:
@@ -503,6 +527,62 @@ class ModelManager:
 
         return input_dict, loss_dict
 
+    def _should_log_grads(self, iteration):
+        """Return True if gradient conflict stats should be computed this step."""
+        if not self.log_grad_conflict:
+            return False
+        if iteration is None:
+            return False
+        return (iteration % self.grad_log_step) == 0
+
+    def _log_gradient_conflict(self, result, iteration):
+        """Compute gradient cosine similarity between seg and clustering losses.
+
+        Always returns all three keys (NaN on non-log steps) so the CSV schema
+        is stable across iterations.
+        """
+        nan = {'grad_cos_sim': float('nan'),
+               'grad_conflict_frac': float('nan'),
+               'grad_mag_ratio': float('nan')}
+
+        if not self._should_log_grads(iteration):
+            return nan
+
+        seg_loss = result.get('seg_loss_iter_last')
+        if seg_loss is None:
+            seg_loss = result.get('seg_loss_iter0')
+        cluster_loss = result.get('edge_loss')
+        if seg_loss is None or cluster_loss is None:
+            return nan
+
+        # Unwrap DDP if necessary, then access the shared decoder parameters
+        backbone = self.net.module if hasattr(self.net, 'module') else self.net
+        try:
+            shared = [p for p in backbone.embedder.decoder.parameters()
+                      if p.requires_grad]
+        except AttributeError:
+            return nan
+        if not shared:
+            return nan
+
+        g_s = torch.autograd.grad(seg_loss, shared, retain_graph=True,
+                                  allow_unused=True)
+        g_c = torch.autograd.grad(cluster_loss, shared, allow_unused=True)
+
+        pairs = [(a, b) for a, b in zip(g_s, g_c)
+                 if a is not None and b is not None]
+        if not pairs:
+            return nan
+
+        gs = torch.cat([g.flatten() for g, _ in pairs])
+        gc = torch.cat([g.flatten() for _, g in pairs])
+        dot = (gs * gc).sum()
+        return {
+            'grad_cos_sim':       (dot / (gs.norm() * gc.norm()).clamp(min=1e-8)).item(),
+            'grad_conflict_frac': ((gs * gc) < 0).float().mean().item(),
+            'grad_mag_ratio':     (gs.norm() / gc.norm().clamp(min=1e-8)).item(),
+        }
+
     def forward(self, data, iteration=None):
         """Pass one minibatch of data through the network and the loss.
 
@@ -538,7 +618,9 @@ class ModelManager:
                     result.update(
                         self.loss_fn(iteration=iteration, **loss_dict, **result)
                     )
-
+            if self.train and self.log_grad_conflict:
+                result.update(self._log_gradient_conflict(result, iteration))
+                
         return result
 
     def backward(self, loss, iteration=None):

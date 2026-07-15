@@ -20,6 +20,12 @@ import numpy as np
 import psutil
 import yaml
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from .ana import AnaManager
 from .banner import ascii_logo
 from .construct import BuildManager
@@ -122,6 +128,7 @@ class Driver:
                 rank=self.rank,
                 distributed=self.distributed,
                 iter_per_epoch=self.iter_per_epoch,
+                seed=self.seed,
             )
 
         else:
@@ -290,6 +297,7 @@ class Driver:
         split_output=False,
         train=None,
         verbosity="info",
+        wandb=None,
     ):
         """Initialize the base driver parameters.
 
@@ -333,6 +341,11 @@ class Driver:
         verbosity : int, default 'info'
             Verbosity level to pass to the `logging` module. Pick one of
             'debug', 'info', 'warning', 'error', 'critical'.
+        wandb : dict, optional
+            Weights & Biases configuration. Supported keys mirror
+            ``wandb.init`` arguments: ``project``, ``entity``, ``name``,
+            ``tags``, ``notes``, ``group``, ``mode``. If omitted or None,
+            W&B logging is disabled.
 
         Returns
         -------
@@ -381,6 +394,8 @@ class Driver:
         self.seed = seed
         self.log_step = log_step
         self.split_output = split_output
+        self.wandb_cfg = wandb         # None disables W&B
+        self.wandb_run = None          # set in initialize_log
 
         return train
 
@@ -573,11 +588,39 @@ class Driver:
         if self.prefix_log:
             log_name = f"{self.log_prefix}_{log_name}"
 
-        # Initialize the log
+        # Initialize the CSV log
         log_path = os.path.join(self.log_dir, log_name)
         self.logger = CSVWriter(
             log_path, overwrite=self.overwrite_log, buffer_size=self.csv_buffer_size
         )
+
+        # Initialize Weights & Biases (main process only)
+        if self.wandb_cfg is not None and self.main_process:
+            if not WANDB_AVAILABLE:
+                logger.warning(
+                    "wandb block found in config but `wandb` package is not "
+                    "installed. Run `pip install wandb` to enable W&B logging."
+                )
+            else:
+                wandb_kwargs = dict(self.wandb_cfg)
+
+                # `run_dir` controls where wandb writes its local run files
+                # Defaults to log_dir so nothing ever lands in ~.
+                run_dir = wandb_kwargs.pop("run_dir", self.log_dir)
+                os.makedirs(run_dir, exist_ok=True)
+
+                wandb_kwargs.setdefault("name", self.log_prefix or log_name)
+
+                # start_method="fork" avoids hangs on cluster nodes where
+                # the default "spawn" method can deadlock with CUDA workers.
+                self.wandb_run = wandb.init(
+                    config=self.cfg,
+                    dir=run_dir,
+                    settings=wandb.Settings(start_method="fork"),
+                    **wandb_kwargs,
+                )
+                logger.info("Weights & Biases run initialized: %s",
+                            self.wandb_run.url)
 
     def __len__(self):
         """Returns the number of events in the underlying reader object.
@@ -670,6 +713,10 @@ class Driver:
         if self.ana is not None:
             self.ana.close()
 
+        # Close the W&B run
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
+
     def process(
         self, entry=None, run=None, subrun=None, event=None, iteration=None, epoch=None
     ):
@@ -706,10 +753,26 @@ class Driver:
                 self.watch.reset()
                 break
 
+        # Reset peak GPU memory counter so log() reports per-iteration peak,
+        # not the lifetime maximum since training started.
+        if runtime.cuda_is_available():
+            runtime.cuda_reset_peak_memory_stats()
+
         self.watch.start("iteration")
 
         # 1. Load data
         data = self.load(entry, run, subrun, event)
+        if self.model is not None and self.model.train:
+            seg_tb = data.get('seg_label')
+            if seg_tb is not None:
+                inp = seg_tb.tensor
+                data['batch_n_voxels'] = inp.shape[0]
+                labels = inp[:, -1]
+                if hasattr(labels, 'numpy'):
+                    labels = labels.cpu().numpy()
+                labels = np.asarray(labels, dtype=np.int32)
+            for cls in range(int(labels.max()) + 1):
+                data[f'batch_n_cls{cls}'] = int((labels == cls).sum())
 
         # 2. Pass data through the model
         if self.model is not None:
@@ -901,8 +964,16 @@ class Driver:
             elif runtime.is_tensor(data[key]) and data[key].dim() == 0:
                 log_dict[key] = data[key].item()
 
-        # Record
+        # Record to CSV
         self.logger.append(log_dict)
+
+        # Record to Weights & Biases (main process only, every step).
+        # Exclude NaN placeholders (present on non-log steps for CSV schema
+        # consistency) so they don't pollute wandb plots.
+        if self.wandb_run is not None and self.main_process:
+            wandb_dict = {k: v for k, v in log_dict.items()
+                          if not (isinstance(v, float) and np.isnan(v))}
+            self.wandb_run.log(wandb_dict, step=iteration)
 
         # If requested, log out basics of the training/inference process
         log = ((iteration + 1) % self.log_step) == 0

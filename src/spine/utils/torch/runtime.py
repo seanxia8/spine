@@ -11,6 +11,7 @@ __all__ = [
     "cuda_is_available",
     "cuda_mem_info",
     "cuda_max_memory_allocated",
+    "cuda_reset_peak_memory_stats",
     "is_tensor",
     "distributed_barrier",
     "require_torch",
@@ -53,6 +54,12 @@ def cuda_max_memory_allocated():
     if TORCH_AVAILABLE and torch.cuda.is_available():
         return torch.cuda.max_memory_allocated()
     return 0
+
+
+def cuda_reset_peak_memory_stats():
+    """Reset the CUDA peak memory counter for the current device."""
+    if TORCH_AVAILABLE and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
 
 def is_tensor(obj):
