@@ -127,12 +127,31 @@ class UResNetAttnSegmentation(nn.Module):
         feats = self.output(feats)
         seg   = self.linear_segmentation(feats)
 
-        attn_tensor = result_backbone['attn_tensors'][-1]
+        attn_raw = result_backbone['attn_tensors']  # list of lists of (num_heads, N_b, N_b)
 
         # Store the output as tensor batches
         segmentation = TensorBatch(seg.F, data.counts)
-        attention_heatmap = TensorBatch(attn_tensor.F, data.counts)
-        #print(f"At decoder output, the attention map has min: {attn_tensor.F.min()}, max: {attn_tensor.F.max()}.")
+
+        # Build a per-voxel attention heatmap from the raw per-head attention
+        # matrices if attention was applied (otherwise fall back to zeros).
+        # attn_raw[-1] is a list over batch elements; each entry has shape
+        # (num_heads, N_b, N_b).  We summarise head×direction→scalar:
+        #   mean over heads of (column-mean of A_h) = mean attention *received*
+        # which is a natural "how much context does voxel j gather?" measure.
+        if len(attn_raw) > 0:
+            per_batch_weights = attn_raw[-1]  # list[Tensor(num_heads, N_b, N_b)]
+            heatmap_parts = []
+            for aw in per_batch_weights:
+                # aw: (num_heads, N_b, N_b)
+                # mean over heads, then mean over queries → (N_b,) attention load
+                load = aw.mean(dim=0).mean(dim=0)  # (N_b,)
+                heatmap_parts.append(load.unsqueeze(1))  # (N_b, 1)
+            heatmap_feats = torch.cat(heatmap_parts, dim=0)  # (N, 1)
+        else:
+            N = seg.F.shape[0]
+            heatmap_feats = torch.zeros(N, 1, device=seg.F.device, dtype=seg.F.dtype)
+
+        attention_heatmap = TensorBatch(heatmap_feats, data.counts)
 
         batch_size = data.batch_size
         #final_tensor = TensorBatch(

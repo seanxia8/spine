@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from .act_norm import act_factory, norm_factory
 from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 import time as time
 from typing import Optional
 
@@ -355,7 +356,10 @@ class AttentionBlock(ME.MinkowskiNetwork):
         try:
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(False)
+            # Keep math SDP enabled as a fallback — disabling it causes
+            # "No available kernel" when Flash and mem-efficient both reject
+            # the input (specific head dim, sequence length, dtype, etc.).
+            torch.backends.cuda.enable_math_sdp(True)
         except Exception:
             pass
 
@@ -433,7 +437,8 @@ class AttentionBlock(ME.MinkowskiNetwork):
         return y
 
 class ClusterAwareAttn(ME.MinkowskiNetwork):
-    def __init__(self, in_channels, embed_dim=256, num_heads=4, dimension=3):
+    def __init__(self, in_channels, embed_dim=256, num_heads=4, dimension=3,
+                 use_hard_mask=False, attn_gain=0.5, analysis_mode=False):
         super().__init__(dimension)
 
         assert in_channels % num_heads == 0, \
@@ -441,7 +446,12 @@ class ClusterAwareAttn(ME.MinkowskiNetwork):
 
         self.in_channels = in_channels
         self.num_heads = num_heads
-        self.head_dim = in_channels // num_heads
+        self.embed_dim = embed_dim
+        self.head_dim = embed_dim // num_heads
+        # use_hard_mask=True  → original float/bool mask path (back-compat)
+        # use_hard_mask=False → soft cluster-direction bias in Q/K (Flash-compatible)
+        self.use_hard_mask = use_hard_mask
+        self.attn_gain = attn_gain
 
         # Projection layers
         self.q_proj = ME.MinkowskiLinear(in_channels, embed_dim)
@@ -449,28 +459,100 @@ class ClusterAwareAttn(ME.MinkowskiNetwork):
         self.v_proj = ME.MinkowskiLinear(in_channels, embed_dim)
         self.out_proj = ME.MinkowskiLinear(embed_dim, in_channels)
 
+        # Used only for hard-mask path
         self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
         # Learnable gate for attention contribution
         self.gate = nn.Parameter(torch.tensor(0.5))
 
+        # When True, attention weights are returned so attn_entropy can be logged.
+        # Disables Flash/mem-efficient SDP (need_weights=True is incompatible).
+        self.analysis_mode = analysis_mode
+        self._last_head_outputs: Optional[list] = None
+
         try:
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(False)
+            # Keep math SDP enabled as a fallback — disabling it causes
+            # "No available kernel" when Flash and mem-efficient both reject
+            # the input (specific head dim, sequence length, dtype, etc.).
+            torch.backends.cuda.enable_math_sdp(True)
         except Exception:
             pass
 
-    def forward(self, x: ME.SparseTensor, attn_mask):
-        #if torch.cuda.is_available():
-        #    torch.cuda.synchronize()
-        #    allocated = torch.cuda.memory_allocated()/(1024**3)
-        #    reserved = torch.cuda.memory_reserved()/(1024**3)
-        #    print(f"\n[AttnBlock START]")
-        #    print(f"  Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
-        #    print(f"  Input size: {x.F.shape[0]} points")
+    def _apply_cluster_direction(self, Q, K, cluster_ids, confidence):
+        """Add confidence-gated cluster centroid direction to Q and K.
 
-        device = x.F.device
+        Computes a per-cluster centroid in Q-space, normalises it, and adds
+        it to both Q and K scaled by per-voxel confidence. Same-cluster pairs
+        receive a boost proportional to conf_i * conf_j; cross-cluster pairs
+        receive no systematic boost (centroids are roughly orthogonal in
+        high-D space). At low confidence the gate → 0 so attention is
+        near-uniform, mirroring the soft-mask behaviour.
+        """
+        # Re-index cluster_ids to contiguous [0, K)
+        _, local_ids = cluster_ids.unique(return_inverse=True)  # (N_b,)
+        K_c = int(local_ids.max().item()) + 1
+
+        # Cluster centroid via scatter_add — O(N) with no Python cluster loop
+        expand = local_ids.unsqueeze(1).expand(-1, self.embed_dim)
+        cluster_sum = torch.zeros(K_c, self.embed_dim, device=Q.device, dtype=Q.dtype)
+        cluster_sum.scatter_add_(0, expand, Q)
+        cluster_cnt = torch.zeros(K_c, device=Q.device, dtype=Q.dtype)
+        cluster_cnt.scatter_add_(0, local_ids, torch.ones(Q.shape[0], device=Q.device, dtype=Q.dtype))
+        centroid = cluster_sum / cluster_cnt.unsqueeze(1).clamp(min=1)  # (K_c, embed_dim)
+
+        # Assign centroid to each voxel and normalise
+        cluster_dir = F.normalize(centroid[local_ids], dim=-1)  # (N_b, embed_dim)
+
+        # Confidence gate: shape (N_b, 1)
+        gate = confidence.unsqueeze(-1) * self.attn_gain
+
+        Q = Q + gate * cluster_dir
+        K = K + gate * cluster_dir
+        return Q, K
+
+    def _extract_per_head_outputs(
+        self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+        attn_weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute per-head output features (N_b, num_heads, head_dim).
+
+        Parameters
+        ----------
+        Q, K, V : torch.Tensor
+            Dense projected features, shape (N_b, embed_dim).
+        attn_weights : torch.Tensor
+            Per-head attention weights, shape (num_heads, N_b, N_b).
+
+        Returns
+        -------
+        torch.Tensor
+            Per-head V-weighted outputs, shape (N_b, num_heads, head_dim).
+        """
+        N_b = V.shape[0]
+        # Reshape V to (num_heads, N_b, head_dim)
+        V_h = V.view(N_b, self.num_heads, self.head_dim).permute(1, 0, 2)
+        # attn_weights: (num_heads, N_b, N_b)
+        # head_out: (num_heads, N_b, head_dim)
+        head_out = torch.bmm(attn_weights, V_h)
+        # Return (N_b, num_heads, head_dim) for easier per-voxel indexing
+        return head_out.permute(1, 0, 2).detach()
+
+    def forward(self, x: ME.SparseTensor, attn_mask=None,
+                cluster_ids=None, confidence=None):
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : ME.SparseTensor
+        attn_mask : list of (N_b, N_b) tensors, optional
+            Pre-built per-event float/bool masks. Used when use_hard_mask=True.
+        cluster_ids : torch.Tensor, optional
+            (N,) integer cluster assignments. Used when use_hard_mask=False.
+        confidence : torch.Tensor, optional
+            (N,) per-voxel confidence in [0,1]. Used when use_hard_mask=False.
+        """
         batch_indices = x.C[:, 0]
 
         # Project to Q, K, V
@@ -478,33 +560,60 @@ class ClusterAwareAttn(ME.MinkowskiNetwork):
         K_st = self.k_proj(x)
         V_st = self.v_proj(x)
 
-        Q = Q_st.F  # (N, C)
+        Q = Q_st.F  # (N, embed_dim)
         K = K_st.F
         V = V_st.F
 
         del Q_st, K_st, V_st
 
-        # Apply attention per batch (memory efficient)
+        # --- Soft path: add confidence-gated cluster direction to Q and K ---
+        # Done globally (all batches at once) before the per-batch loop.
+        if not self.use_hard_mask and cluster_ids is not None and confidence is not None:
+            Q, K = self._apply_cluster_direction(Q, K, cluster_ids, confidence)
+
         attended_F = torch.zeros_like(Q)
         attn_weights_list = []
+
+        if self.analysis_mode:
+            self._last_head_outputs = []
 
         unique_batches = torch.unique(batch_indices, sorted=True)
         for b in unique_batches.tolist():
             batch_mask = (batch_indices == b)
-            batch_Q = Q[batch_mask]  # (N_b, C)
-            batch_K = K[batch_mask]
-            batch_V = V[batch_mask]
-            N = int(torch.sum(batch_mask))
-            batch_attn_mask = attn_mask[b, :N, :N]
-            attn_out, attn_weights = self.mha(
-                batch_Q, batch_K, batch_V,
-                attn_mask = batch_attn_mask,
-            )
+            batch_Q = Q[batch_mask].unsqueeze(0)  # (1, N_b, embed_dim)
+            batch_K = K[batch_mask].unsqueeze(0)
+            batch_V = V[batch_mask].unsqueeze(0)
 
-            attended_F[batch_mask] = attn_out.squeeze(0)
-            attn_weights_list.append(attn_weights.squeeze(0).detach())
+            if self.use_hard_mask:
+                # --- Hard-mask path: float/bool mask, forces math SDP backend ---
+                batch_attn_mask = attn_mask[b]
+                attn_out, attn_weights = self.mha(
+                    batch_Q, batch_K, batch_V,
+                    attn_mask=batch_attn_mask,
+                    need_weights=self.analysis_mode,
+                    average_attn_weights=False,
+                )
+                attended_F[batch_mask] = attn_out.squeeze(0)
+                if self.analysis_mode and attn_weights is not None:
+                    aw = attn_weights.squeeze(0).detach()
+                    attn_weights_list.append(aw)
+                    head_outs = self._extract_per_head_outputs(
+                        Q[batch_mask], K[batch_mask], V[batch_mask], aw
+                    )
+                    self._last_head_outputs.append(head_outs)
+                else:
+                    attn_weights_list.append(None)
+                del batch_attn_mask, attn_out, attn_weights
+            else:
+                # --- Soft path: no mask, Flash/mem-efficient SDP ---
+                attn_out = F.scaled_dot_product_attention(
+                    batch_Q, batch_K, batch_V
+                )
+                attended_F[batch_mask] = attn_out.squeeze(0)
+                attn_weights_list.append(None)
+                del attn_out
 
-            del batch_Q, batch_K, batch_V, attn_out, attn_weights, batch_attn_mask
+            del batch_Q, batch_K, batch_V
 
         attended_st = ME.SparseTensor(
             features=attended_F,
@@ -524,14 +633,6 @@ class ClusterAwareAttn(ME.MinkowskiNetwork):
             coordinate_map_key=x.coordinate_map_key,
             coordinate_manager=x.coordinate_manager
         )
-
-        #if torch.cuda.is_available():
-        #    torch.cuda.synchronize()
-        #    allocated = torch.cuda.memory_allocated()/(1024**3)
-        #    reserved = torch.cuda.memory_reserved()/(1024**3)
-        #    print(f"\n[AttnBlock END]")
-        #    print(f"  Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
-        #    print(f"  Input size: {x.F.shape[0]} points")
 
         return final_st, attn_weights_list
 

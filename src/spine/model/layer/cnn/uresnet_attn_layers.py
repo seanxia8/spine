@@ -9,6 +9,7 @@ Contains the following components:
 from typing import List
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as ckpt
 
 import MinkowskiEngine as ME
 
@@ -131,11 +132,12 @@ class UResNetAttnDecoder(torch.nn.Module):
         ##self.bn_attn = AttentionBlock(in_channels=top_c, out_channels=top_c,
         #                              dimension=self.dim, embed_dim=self.embed_dim,
         #                              num_heads=self.num_heads, lower=self.lower, upper=self.upper)
-        if enable_attention:
-            self.bn_attn = ClusterAwareAttn(in_channels=top_c, dimension=self.dim, embed_dim=self.embed_dim, num_heads=self.num_heads)
-        else:
-            self.bn_attn = None
-        self.gain = getattr(self, "attn_gain", 0.75)  # expose via config
+        self.enable_attention = enable_attention
+        use_hard_mask = getattr(self, "use_hard_mask", False)
+        attn_gain     = getattr(self, "attn_gain", 0.5)
+        analysis_mode = getattr(self, "analysis_mode", False)
+        self.use_hard_mask = use_hard_mask
+        self.checkpoint_attn = getattr(self, "checkpoint_attn", True)
         # Initialize decoder
         self.decoding_block = []
         self.decoding_conv = []
@@ -162,6 +164,14 @@ class UResNetAttnDecoder(torch.nn.Module):
             self.decoding_block.append(m)
         self.decoding_block = torch.nn.Sequential(*self.decoding_block)
         self.decoding_conv = torch.nn.Sequential(*self.decoding_conv)
+        if self.enable_attention:
+            self.bn_attn = ClusterAwareAttn(
+                in_channels=top_c, dimension=self.dim,
+                embed_dim=self.embed_dim, num_heads=self.num_heads,
+                use_hard_mask=use_hard_mask, attn_gain=attn_gain,
+                analysis_mode=analysis_mode)
+        else:
+            self.bn_attn = None
     '''    
     def _sparse_pc_mapping(self, g: ME.SparseTensor, tgt: ME.SparseTensor) -> ME.SparseTensor:
         """
@@ -207,7 +217,8 @@ class UResNetAttnDecoder(torch.nn.Module):
             coordinate_manager=cm,
         )
     '''
-    def forward(self, x_bn: ME.SparseTensor, encoder_tensors, cluster_ids=None):
+    def forward(self, x_bn: ME.SparseTensor, encoder_tensors, cluster_ids=None,
+                node_confidence=None):
         """Pass a tensor through the decoder.
 
         Parameters
@@ -216,6 +227,13 @@ class UResNetAttnDecoder(torch.nn.Module):
             Output of the encoder
         encoder_tensors : List[ME.SparseTensor]
             List of tensors from each depth of the encoder
+        cluster_ids : torch.Tensor, optional
+            (N,) integer cluster assignment used to build the attention mask.
+        node_confidence : torch.Tensor, optional
+            (N,) per-voxel confidence in [0, 1] derived from edge probabilities.
+            Passed to ``mask_cluster_id`` so that cross-cluster suppression is
+            soft (proportional to confidence) rather than hard.  When ``None``
+            the mask falls back to the original hard -inf / 0 behaviour.
 
         Returns
         -------
@@ -247,30 +265,35 @@ class UResNetAttnDecoder(torch.nn.Module):
 
             # Apply cluster-aware attention at this decoder level
             if self.bn_attn is not None and cluster_ids is not None and i == len(self.decoding_conv) - 1:
-                #torch.cuda.synchronize()
-                #vram = torch.cuda.memory_allocated() / (1024 ** 2)  # in MB
-                #print(f"Before attn mask VRAM: {vram:.2f} MB")
-
-                #self.bn_attn.call_count = 0
-                # At final decoder output (full resolution)
-                attn_mask = mask_cluster_id(
-                    x,
-                    cluster_ids,
-                    mode=self.attn_mode  # Focus on boundaries where errors occur
-                )
-                #torch.cuda.synchronize()
-                #vram = torch.cuda.memory_allocated() / (1024 ** 2) - vram # in MB
-                #print(f"Attn mask VRAM: {vram:.2f} MB")
-
-                # Attention output still has gradients, weights don't
-                #with torch.no_grad():
-                #    _, attn_weights = self.bn_attn(x, attn_mask)
-                #    attn_tensors.append(attn_weights)
-
                 torch.cuda.empty_cache()
-                x, attn_weights = self.bn_attn(x, attn_mask)
-                del attn_mask
-                attn_tensors.append([ aw.detach() for aw in attn_weights])
+                if self.use_hard_mask:
+                    # Hard {0, -inf} binary mask — no confidence weighting.
+                    # Passing confidence=None forces create_*_mask to produce
+                    # the binary mask, which is compatible with PyTorch's
+                    # mem-efficient SDP backend (Flash SDP doesn't support
+                    # arbitrary float additive masks but mem-efficient does).
+                    attn_mask = mask_cluster_id(
+                        x, cluster_ids,
+                        confidence=None,
+                        mode=self.attn_mode
+                    )
+                    if self.checkpoint_attn and self.training:
+                        x, attn_weights = ckpt.checkpoint(
+                            self.bn_attn, x, attn_mask, use_reentrant=False)
+                    else:
+                        x, attn_weights = self.bn_attn(x, attn_mask=attn_mask)
+                    del attn_mask
+                else:
+                    # Soft cluster-direction path: no mask, Flash-compatible.
+                    if self.checkpoint_attn and self.training:
+                        x, attn_weights = ckpt.checkpoint(
+                            self.bn_attn, x, None, cluster_ids, node_confidence,
+                            use_reentrant=False)
+                    else:
+                        x, attn_weights = self.bn_attn(
+                            x, cluster_ids=cluster_ids, confidence=node_confidence)
+                attn_tensors.append([aw.detach() if aw is not None else None
+                                     for aw in attn_weights])
 
                 #torch.cuda.synchronize()
                 #vram = torch.cuda.memory_allocated() / (1024 ** 2) - vram  # in MB

@@ -2,6 +2,43 @@
 
 import MinkowskiEngine as ME
 import torch
+import torch.nn as nn
+
+
+class MinkowskiLayerNorm(nn.Module):
+    """Layer Normalization for MinkowskiEngine Sparse Tensors.
+
+    Normalizes across the feature (channel) dimension for each active voxel
+    independently — equivalent to torch.nn.LayerNorm applied per voxel.
+    Unlike BatchNorm this has no running statistics and is identical at
+    train and inference time, making it robust to small batches and
+    variable voxel counts.
+
+    Parameters
+    ----------
+    num_features : int
+        Number of feature channels (normalized_shape for LayerNorm).
+    eps : float, default 1e-5
+        Numerical stability term.
+    elementwise_affine : bool, default True
+        If True, learns per-channel scale (gamma) and shift (beta).
+    """
+
+    def __init__(self, num_features, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        self.ln = nn.LayerNorm(num_features, eps=eps,
+                               elementwise_affine=elementwise_affine)
+
+    def forward(self, x: ME.SparseTensor) -> ME.SparseTensor:
+        out = self.ln(x.F)   # (N_active, C) → normalized per voxel across C
+        return ME.SparseTensor(
+            out,
+            coordinate_manager=x.coordinate_manager,
+            coordinate_map_key=x.coordinate_map_key,
+        )
+
+    def __repr__(self):
+        return f"MinkowskiLayerNorm({self.ln.normalized_shape[0]}, eps={self.ln.eps})"
 
 
 class MinkowskiPixelNorm(torch.nn.Module):

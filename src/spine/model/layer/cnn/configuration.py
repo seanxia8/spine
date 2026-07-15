@@ -19,6 +19,9 @@ def setup_cnn_configuration(
     num_heads=8, 
     attn_gain=0.75,
     attn_mode='boundary',
+    checkpoint_attn=True,
+    use_hard_mask=False,
+    analysis_mode=False,
 ):
 
     """Base function for global network parameters (CNN-based models).
@@ -68,6 +71,10 @@ def setup_cnn_configuration(
         Number of heads per attention
     attn_gain: float, default 0.75
         Gain for applying attention gate weight
+    checkpoint_attn : bool, default True
+        If True, use gradient checkpointing on the attention block during
+        training.  Avoids storing O(N² × heads) attention weights for backward
+        at the cost of one extra forward pass through the attention.
     """
     # Store the base parameters
     self.reps = reps
@@ -95,4 +102,8 @@ def setup_cnn_configuration(
     self.num_heads = num_heads
     self.attn_gain = attn_gain
     self.attn_mode = attn_mode
+    self.checkpoint_attn = checkpoint_attn
+
+    self.use_hard_mask = use_hard_mask
+    self.analysis_mode = analysis_mode
 

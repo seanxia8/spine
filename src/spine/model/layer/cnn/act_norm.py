@@ -46,6 +46,7 @@ def norm_dict():
         "batch_norm": ME.MinkowskiBatchNorm,
         "instance_norm": ME.MinkowskiInstanceNorm,
         "pixel_norm": normalizations.MinkowskiPixelNorm,
+        "layer_norm": normalizations.MinkowskiLayerNorm,
     }
 
     return norm_layers
