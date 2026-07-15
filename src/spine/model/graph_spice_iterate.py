@@ -112,7 +112,6 @@ class GraphSPICEIter(torch.nn.Module):
                              make_clusters=False, n_iterations=2,
                              use_attention=True, use_confidence_mask=True,
                              do_iterate=None, edge_projection=None,
-                             detach_edge_features=False,
                              track_iter_metrics=False, log_step=1,
                              feature_graph_warmup_steps=0,
                              cluster_semantic_pool=False,
@@ -196,20 +195,9 @@ class GraphSPICEIter(torch.nn.Module):
         # (use_attention=False) shares the same architecture as the full system.
         #enable_attention = (n_iterations > 1)
 
-        # detach_edge_features: single flag that stops backbone gradient from
-        # reaching the edge-score computation, regardless of which path is used.
-        #   use_raw_features=True  → detach in build_graph before kernel/edge_proj
-        #   use_raw_features=False → detach in embedder before hypergraph heads
-        # The edge_projection layers (if any) remain connected to each other via
-        # edge loss; only the backbone is isolated.
-        self.detach_edge_features = detach_edge_features
-
-        # Pass detach_edge_features to the embedder; it resolves which internal
-        # path to apply it to (hypergraph heads when use_raw_features=False).
         self.embedder = AttnGraphSPICEEmbedder(
                 **embedder, use_raw_features=use_raw_features,
-                enable_attention=self.use_attention,
-                detach_edge_features=detach_edge_features)
+                enable_attention=self.use_attention)
 
         # Initialize the kernel function (must be owned here to be loaded)
         self.kernel_fn = kernel_factory(kernel)
@@ -218,11 +206,8 @@ class GraphSPICEIter(torch.nn.Module):
         self.edge_proj = self._build_edge_proj(edge_projection,
                                                kernel['num_features'])
 
-        # Initialize the graph constructor — pass both flags separately so that
-        # detach and projection are independently controllable.
         self.constructor = ClusterGraphConstructor(
                 **constructor, kernel_fn=self.kernel_fn, edge_proj=self.edge_proj,
-                detach_edge_features=detach_edge_features and use_raw_features,
                 shapes=shapes, invert=invert, training=self.training)
 
         # Parse the set of shapes to cluster

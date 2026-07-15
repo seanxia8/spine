@@ -62,8 +62,7 @@ class AttnGraphSPICEEmbedder(nn.Module):
     def process_model_config(self, predict_semantics=False, num_classes=None,
                              coord_conv=True, covariance_mode='softplus',
                              occupancy_mode='softplus', feature_embedding_dim=16,
-                             spatial_embedding_dim=3, use_raw_features=False,
-                             detach_edge_features=False):
+                             spatial_embedding_dim=3, use_raw_features=False):
         """Process the embedding parameters.
 
         Parameters
@@ -90,11 +89,8 @@ class AttnGraphSPICEEmbedder(nn.Module):
         self.num_classes = num_classes
         self.coord_conv = coord_conv
         self.predict_semantics  = predict_semantics
+        self.flip_semantic_cluster = flip_semantic_cluster & predict_semantics # only flip if both are True
         self.use_raw_features   = use_raw_features
-        # detach_edge_features: stop backbone gradient before edge-score computation.
-        # Only applies when use_raw_features=False (hypergraph path); the raw-features
-        # path is handled in build_graph via ClusterGraphConstructor.detach_edge_features.
-        self.detach_hypergraph  = detach_edge_features and not use_raw_features
         self.covariance_mode = covariance_mode
         self.occupancy_mode = occupancy_mode
 
@@ -166,8 +162,7 @@ class AttnGraphSPICEEmbedder(nn.Module):
             if not self.use_raw_features:
                 # Produce hypergraph_features so _get_features() works regardless
                 # of which pass (first or attention) calls it.
-                proj_feats = output_features.detach() if self.detach_hypergraph \
-                             else output_features
+                proj_feats = output_features
                 spatial_embeddings = self.out_spatial(proj_feats)
                 feature_embeddings = self.out_feature(proj_feats)
                 out = self.out_cov(proj_feats); covariance = self.cov_func(out)
@@ -201,9 +196,7 @@ class AttnGraphSPICEEmbedder(nn.Module):
 
         # If requested, pass the raw output features through final layers
         if not self.use_raw_features:
-            # Optionally stop gradient to backbone before the projection heads.
-            proj_feats = output_features.detach() if self.detach_hypergraph \
-                         else output_features
+            proj_feats = output_features
             # Spatial Embeddings (offset by the normalized coordinates)
             spatial_embeddings = self.out_spatial(proj_feats)
 

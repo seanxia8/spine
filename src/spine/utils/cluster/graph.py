@@ -94,7 +94,6 @@ class ClusterGraphConstructor:
         edge_threshold,
         kernel_fn=None,
         edge_proj=None,
-        detach_edge_features=False,
         min_size=0,
         invert=True,
         label_edges=False,
@@ -164,7 +163,6 @@ class ClusterGraphConstructor:
         self.label_edges = label_edges
         self.kernel_fn          = kernel_fn
         self.edge_proj          = edge_proj
-        self.detach_edge_features = detach_edge_features
         self.target_col = target_col
 
         def _build_graph_fn(cfg, label):
@@ -364,15 +362,7 @@ class ClusterGraphConstructor:
             ).norm(dim=1).detach()
 
             # Produce edge predictions.
-            # detach_edge_features stops backbone gradient independently of
-            # whether edge_proj is set — the two are orthogonal controls:
-            #   detach=True,  proj=None : kernel operates on detached raw features
-            #   detach=True,  proj=set  : proj adapts on detached features
-            #   detach=False, proj=set  : proj AND backbone both see edge loss
-            #   detach=False, proj=None : current default behaviour
             features_s = features[seg_index]
-            if self.detach_edge_features:
-                features_s = features_s.detach()
             if self.edge_proj is not None:
                 features_s = self.edge_proj(features_s)
             edge_attr = self.kernel_fn(
