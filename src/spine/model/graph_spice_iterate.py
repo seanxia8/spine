@@ -623,23 +623,20 @@ class GraphSPICEIter(torch.nn.Module):
                 valid = node_pred.tensor >= 0
 
                 segmentation_iter0_raw = segmentation_iter0.tensor
-                segmentation_cluster_pooled = scatter_mean(segmentation_iter0_raw[valid], node_pred.tensor[valid], dim=0)
-                segmentation_vox_pooled = torch.zeros(node_pred.tensor.shape[0], segmentation_cluster_pooled.shape[1], 
-                                                      dtype=segmentation_iter0_raw.dtype, device=segmentation_iter0_raw.device)
-                segmentation_vox_pooled[valid] = segmentation_cluster_pooled[node_pred.tensor[valid]]
-                
                 with torch.no_grad():
                     node_argmax = torch.argmax(segmentation_iter0_raw, dim=1)
                     one_hot = F.one_hot(node_argmax, num_classes=segmentation_iter0_raw.shape[1]).float()
                     vote_counts = scatter_add(one_hot[valid], node_pred.tensor[valid], dim=0)
-                    segmentation_hard_pool_inter = vote_counts / vote_counts.sum(dim=1, keepdim=True).clamp(min=1)
+                    vote_fracs  = vote_counts / vote_counts.sum(dim=1, keepdim=True).clamp(min=1)
 
-                    segmentation_hard_vox_pooled = torch.zeros(node_pred.tensor.shape[0], segmentation_hard_pool_inter.shape[1], 
-                                                               dtype=segmentation_iter0_raw.dtype, device=segmentation_iter0_raw.device)
-                    segmentation_hard_vox_pooled[valid] = segmentation_hard_pool_inter[node_pred.tensor[valid]]
+                    hard_vox = torch.zeros(node_pred.tensor.shape[0], vote_fracs.shape[1],
+                                        dtype=segmentation_iter0_raw.dtype,
+                                        device=segmentation_iter0_raw.device)
+                    hard_vox[valid] = vote_fracs[node_pred.tensor[valid]]
 
-                segmentation_iter0 = TensorBatch(segmentation_vox_pooled - segmentation_vox_pooled.detach() + segmentation_hard_vox_pooled.detach(), segmentation_iter0.counts)
-                
+            # STE: forward = vote-fraction soft probs, gradient flows via raw logits
+            pooled = segmentation_iter0_raw - segmentation_iter0_raw.detach() + hard_vox
+            segmentation_iter0 = TensorBatch(pooled, segmentation_iter0.counts)
             if segmentation_iter0 is not None:
                 result['segmentation_iter0'] = segmentation_iter0
             return result
