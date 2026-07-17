@@ -62,7 +62,8 @@ class AttnGraphSPICEEmbedder(nn.Module):
     def process_model_config(self, predict_semantics=False, num_classes=None,
                              coord_conv=True, covariance_mode='softplus',
                              occupancy_mode='softplus', feature_embedding_dim=16,
-                             spatial_embedding_dim=3, use_raw_features=False):
+                             spatial_embedding_dim=3, use_raw_features=False,
+                             f):
         """Process the embedding parameters.
 
         Parameters
@@ -89,7 +90,6 @@ class AttnGraphSPICEEmbedder(nn.Module):
         self.num_classes = num_classes
         self.coord_conv = coord_conv
         self.predict_semantics  = predict_semantics
-        self.flip_semantic_cluster = flip_semantic_cluster & predict_semantics # only flip if both are True
         self.use_raw_features   = use_raw_features
         self.covariance_mode = covariance_mode
         self.occupancy_mode = occupancy_mode
