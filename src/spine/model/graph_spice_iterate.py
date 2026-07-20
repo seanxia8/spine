@@ -630,13 +630,14 @@ class GraphSPICEIter(torch.nn.Module):
                     vote_fracs  = vote_counts / vote_counts.sum(dim=1, keepdim=True).clamp(min=1)
 
                     hard_vox = torch.zeros(node_pred.tensor.shape[0], vote_fracs.shape[1],
-                                        dtype=segmentation_iter0_raw.dtype,
-                                        device=segmentation_iter0_raw.device)
+                                           dtype=segmentation_iter0_raw.dtype,
+                                           device=segmentation_iter0_raw.device)
                     hard_vox[valid] = vote_fracs[node_pred.tensor[valid]]
 
-            # STE: forward = vote-fraction soft probs, gradient flows via raw logits
-            pooled = segmentation_iter0_raw - segmentation_iter0_raw.detach() + hard_vox
-            segmentation_iter0 = TensorBatch(pooled, segmentation_iter0.counts)
+                # STE: forward = vote-fraction soft probs, gradient flows via raw logits
+                pooled = segmentation_iter0_raw - segmentation_iter0_raw.detach() + hard_vox
+                segmentation_iter0 = TensorBatch(pooled, segmentation_iter0.counts)
+
             if segmentation_iter0 is not None:
                 result['segmentation_iter0'] = segmentation_iter0
             return result

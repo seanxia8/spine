@@ -1,15 +1,16 @@
-"""Module that handles conditional imports for optional packages.
+"""Lazy access to optional third-party dependencies.
 
-Currently wraps the following packages:
-- ROOT: only needed when parsing ROOT-format data
-- larcv: only needed when reading larcv-format data in parsers
-- torch: only needed when running ML models and training
-- MinkowskiEngine: only needed when running sparse CNNs
+The symbols exported here preserve the previous
+``from spine.utils.conditional import torch`` style while avoiding eager imports
+and unrelated warnings. Availability flags are cheap import-spec checks. The
+actual package import is deferred until an attribute on the proxy is used.
 """
 
+import importlib
+import importlib.util
 import os
-from typing import TYPE_CHECKING, Any, Optional
-from warnings import warn
+import sys
+from typing import TYPE_CHECKING, Any, Protocol, TypeGuard
 
 __all__ = [
     "ROOT",
@@ -21,110 +22,234 @@ __all__ = [
     "LARCV_AVAILABLE",
     "TORCH_AVAILABLE",
     "ME_AVAILABLE",
+    "SparseTensorLike",
 ]
 
 
-# Initialize availability flags
-ROOT_AVAILABLE = False
-LARCV_AVAILABLE = False
-TORCH_AVAILABLE = False
-ME_AVAILABLE = False
+class SparseTensorLike(Protocol):
+    """Structural type for MinkowskiEngine sparse tensors.
 
-# If ROOT is available, load it
-if TYPE_CHECKING:
-    # Type checkers see the real ROOT module
-    import ROOT
+    MinkowskiEngine is an optional runtime dependency exposed through a lazy
+    proxy, so ``ME.SparseTensor`` cannot be used directly in type expressions.
+    This protocol captures the sparse tensor surface used by SPINE without
+    making static analysis depend on MinkowskiEngine stubs.
+    """
 
-    ROOT_AVAILABLE = True
-else:
-    # Runtime does conditional import
-    ROOT: Optional[Any]
+    dtype: Any
+    device: Any
+    F: Any
+    C: Any
+    coordinate_map_key: Any
+    coordinate_manager: Any
+
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, index: Any) -> Any: ...
+
+    def features_at(self, batch_id: int) -> Any: ...
+
+    def coordinates_at(self, batch_id: int) -> Any: ...
+
+
+def is_sparse_tensor_like(obj: object) -> TypeGuard[SparseTensorLike]:
+    """Check whether an object exposes the sparse tensor API SPINE uses."""
+    return (
+        hasattr(obj, "dtype")
+        and hasattr(obj, "F")
+        and hasattr(obj, "C")
+        and hasattr(obj, "coordinate_map_key")
+        and hasattr(obj, "coordinate_manager")
+    )
+
+
+class _MissingType:
+    """Placeholder type used for annotations and simple availability checks."""
+
+
+class _MissingNamespace:
+    """Annotation-safe namespace for unavailable optional modules.
+
+    This allows type-hint evaluation of chained names such as
+    ``torch.utils.data.Dataset`` without importing the real dependency. Any
+    apparent runtime use still raises the original import error when called.
+    """
+
+    def __init__(self, error: str) -> None:
+        self._error = error
+
+    def __getattr__(self, name: str) -> Any:
+        if name and name[0].isupper():
+            return _MissingType
+        return self
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise ImportError(self._error)
+
+
+class _LazyModule:
+    """Proxy that imports an optional module on first real use."""
+
+    def __init__(self, import_name: str, display_name: str, error: str) -> None:
+        self._import_name = import_name
+        self._display_name = display_name
+        self._error = error
+        self._module = None
+
+    def _load(self) -> Any:
+        if self._module is None:
+            try:
+                self._module = importlib.import_module(self._import_name)
+            except ModuleNotFoundError as exc:
+                raise ImportError(self._error) from exc
+        return self._module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+    def __repr__(self) -> str:
+        if self._module is None:
+            return f"<lazy module {self._display_name}>"
+        return repr(self._module)
+
+
+class _LazyAttribute:
+    """Proxy for an attribute imported from an optional module."""
+
+    def __init__(
+        self, module_name: str, attr_name: str, display_name: str, error: str
+    ) -> None:
+        self._module_name = module_name
+        self._attr_name = attr_name
+        self._display_name = display_name
+        self._error = error
+        self._attr = None
+
+    def _load(self) -> Any:
+        if self._attr is None:
+            try:
+                module = importlib.import_module(self._module_name)
+            except ModuleNotFoundError as exc:
+                raise ImportError(self._error) from exc
+            self._attr = getattr(module, self._attr_name)
+        return self._attr
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._load()(*args, **kwargs)
+
+    def __repr__(self) -> str:
+        if self._attr is None:
+            return f"<lazy attribute {self._display_name}>"
+        return repr(self._attr)
+
+
+class _MissingTorch(_LazyModule):
+    """Torch proxy with a Tensor placeholder when torch is unavailable."""
+
+    Tensor = _MissingType
+    BoolTensor = _MissingType
+    LongTensor = _MissingType
+    FloatTensor = _MissingType
+
+    def __getattr__(self, name: str) -> Any:
+        if name and name[0].isupper():
+            return _MissingType
+        return _MissingNamespace(self._error)
+
+
+class _MissingME(_LazyModule):
+    """MinkowskiEngine proxy with a SparseTensor placeholder when unavailable."""
+
+    SparseTensor = _MissingType
+
+    def __getattr__(self, name: str) -> Any:
+        if name and name[0].isupper():
+            return _MissingType
+        return _MissingNamespace(self._error)
+
+
+def _module_available(module_name: str) -> bool:
+    if os.getenv("SPINE_DOC_BUILD") and module_name in {
+        "torch",
+        "MinkowskiEngine",
+        "MinkowskiFunctional",
+        "larcv",
+        "ROOT",
+    }:
+        return False
+
+    if module_name in sys.modules:
+        module = sys.modules[module_name]
+        if module is None:
+            return False
+
+        # PyROOT can be preloaded by external environment setup with
+        # `__spec__ = None`. In that state, `find_spec("ROOT")` raises a
+        # ValueError even though the already-loaded module may be usable.
+        if module_name == "ROOT":
+            return True
+
+        # LArCV exposes the actual bindings as the `larcv` attribute on the
+        # top-level module. Accept preloaded modules that provide it without
+        # querying importlib metadata again.
+        if module_name == "larcv":
+            return hasattr(module, "larcv")
+
+        # Sphinx autodoc mock imports can populate `sys.modules` with
+        # lightweight placeholders that do not correspond to a real importable
+        # package. Only treat other preloaded modules as available when they
+        # carry a real module spec.
+        if getattr(module, "__spec__", None) is not None:
+            return True
+
     try:
-        import ROOT
+        if importlib.util.find_spec(module_name) is not None:
+            return True
+    except (ImportError, ValueError):
+        return False
 
-        ROOT_AVAILABLE = True
-    except ModuleNotFoundError:
-        warn("ROOT could not be found, cannot parse LArCV data.")
-        ROOT = None
+    return False
 
 
-# If LArCV is available, load it
+ROOT_AVAILABLE = _module_available("ROOT")
+LARCV_AVAILABLE = _module_available("larcv")
+TORCH_AVAILABLE = _module_available("torch")
+ME_AVAILABLE = _module_available("MinkowskiEngine")
+
 if TYPE_CHECKING:
-    # Type checkers see the real larcv module
-    from larcv import larcv
-
-    LARCV_AVAILABLE = True
-else:
-    # Runtime does conditional import
-    larcv: Optional[Any]
-    try:
-        from larcv import larcv
-
-        LARCV_AVAILABLE = True
-    except ModuleNotFoundError:
-        warn("larcv could not be found, cannot parse LArCV data.")
-        larcv = None
-
-
-# If torch is available, load it
-if TYPE_CHECKING:
-    # Type checkers see the real torch module
-    import torch
-
-    TORCH_AVAILABLE = True
-else:
-    # Runtime does conditional import
-    torch: Optional[Any]
-    try:
-        import torch
-
-        if not hasattr(torch, "Tensor"):
-            raise ImportError("Imported torch module has no Tensor attribute.")
-
-        TORCH_AVAILABLE = True
-    except (ModuleNotFoundError, ImportError):
-        warn("PyTorch could not be found, ML functionality disabled.")
-
-        class DummyTorch:
-            """Minimal torch stand-in for annotations and isinstance checks."""
-
-            class Tensor:
-                """Dummy tensor type."""
-
-            def __getattr__(self, name: str) -> Any:
-                raise ImportError("PyTorch is required for this functionality.")
-
-        torch = DummyTorch()
-
-# If MinkowskiEngine is available, load it with the right number of threads
-if TYPE_CHECKING:
-    # Type checkers see the real MinkowskiEngine modules
     import MinkowskiEngine as ME
     import MinkowskiFunctional as MF
-
-    ME_AVAILABLE = True
+    import ROOT
+    import torch
+    from larcv import larcv
 else:
-    # Runtime does conditional import
-    ME: Optional[Any]
-    MF: Optional[Any]
-    try:
-        if os.environ.get("OMP_NUM_THREADS") is None:
-            os.environ["OMP_NUM_THREADS"] = "16"
-        import MinkowskiEngine as ME
-        import MinkowskiFunctional as MF
+    ROOT = _LazyModule("ROOT", "ROOT", "ROOT is required to parse LArCV data.")
+    larcv = _LazyAttribute(
+        "larcv", "larcv", "larcv.larcv", "larcv is required to parse LArCV data."
+    )
 
-        ME_AVAILABLE = True
-    except ModuleNotFoundError:
-        warn("MinkowskiEngine could not be found, cannot run sparse CNNs.")
+    if TORCH_AVAILABLE:
+        torch = _LazyModule("torch", "torch", "PyTorch is required.")
+    else:
+        torch = _MissingTorch("torch", "torch", "PyTorch is required.")
 
-        class DummyME:
-            """Minimal MinkowskiEngine stand-in for annotations and checks."""
-
-            class SparseTensor:
-                """Dummy sparse tensor type."""
-
-            def __getattr__(self, name: str) -> Any:
-                raise ImportError("MinkowskiEngine is required for this functionality.")
-
-        ME = DummyME()
-        MF = None
+    if ME_AVAILABLE:
+        ME = _LazyModule(
+            "MinkowskiEngine", "MinkowskiEngine", "MinkowskiEngine is required."
+        )
+        MF = _LazyModule(
+            "MinkowskiFunctional",
+            "MinkowskiFunctional",
+            "MinkowskiFunctional is required.",
+        )
+    else:
+        ME = _MissingME(
+            "MinkowskiEngine", "MinkowskiEngine", "MinkowskiEngine is required."
+        )
+        MF = _LazyModule(
+            "MinkowskiFunctional",
+            "MinkowskiFunctional",
+            "MinkowskiFunctional is required.",
+        )

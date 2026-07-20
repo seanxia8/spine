@@ -7,7 +7,7 @@ from warnings import warn
 import numpy as np
 
 from spine.constants import PID_LABELS, PID_TAGS, SHOWR_SHP
-from spine.data.decorator import stored_property
+from spine.data.decorator import stored_alias, stored_property
 from spine.data.field import FieldMetadata
 from spine.data.larcv.neutrino import Neutrino
 
@@ -325,6 +325,7 @@ class InteractionBase(OutBase):
             if hasattr(particles[0], attr):
                 if len(np.unique([getattr(p, attr) for p in particles])) >= 2:
                     raise ValueError(f"{attr} must be unique in the list of particles.")
+                setattr(interaction, attr, getattr(particles[0], attr))
 
         # Attach particle list
         interaction.particles = particles
@@ -346,12 +347,22 @@ class RecoInteraction(InteractionBase, RecoBase):
     ----------
     particles : List[RecoParticle]
         List of particles that make up the interaction
+    dir : np.ndarray
+        (3) Direction of the interaction
+    reco_dir : np.ndarray
+        Alias for `dir`, to match nomenclature in truth
     """
 
     # Object list attributes
     particles: list[RecoParticle] = field(  # type: ignore[assignment]
         default_factory=lambda: [],
         metadata=FieldMetadata(skip=True),
+    )
+
+    # Vector attributes
+    dir: np.ndarray = field(
+        default_factory=lambda: np.full(3, np.nan, dtype=np.float32),
+        metadata=FieldMetadata(length=3, dtype=np.float32, vector=True),
     )
 
     def __str__(self):
@@ -383,6 +394,12 @@ class RecoInteraction(InteractionBase, RecoBase):
 
         return max(showers, key=lambda x: cast(float, x.ke))
 
+    @property
+    @stored_alias("dir")
+    def reco_dir(self) -> np.ndarray:
+        """Alias for `dir`, to match nomenclature in truth."""
+        return self.dir
+
 
 @dataclass(eq=False, repr=False)
 class TruthInteraction(Neutrino, InteractionBase, TruthBase):
@@ -399,6 +416,8 @@ class TruthInteraction(Neutrino, InteractionBase, TruthBase):
         Index of the neutrino matched to this interaction
     reco_vertex : np.ndarray
         (3) Coordinates of the reconstructed interaction vertex
+    reco_dir : np.ndarray
+        (3) Reconstructed direction of the interaction
     """
 
     # Scalar attributes
@@ -419,6 +438,10 @@ class TruthInteraction(Neutrino, InteractionBase, TruthBase):
             position=True,
             units="instance",
         ),
+    )
+    reco_dir: np.ndarray = field(
+        default_factory=lambda: np.full(3, np.nan, dtype=np.float32),
+        metadata=FieldMetadata(length=3, dtype=np.float32, vector=True),
     )
 
     def __str__(self) -> str:

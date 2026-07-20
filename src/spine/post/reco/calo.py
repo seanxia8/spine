@@ -1,11 +1,16 @@
 """Calorimetric energy reconstruction module."""
 
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 import numexpr as ne
 import numpy as np
 
+from spine.calib import CalibrationManager
 from spine.constants import TRACK_SHP
 from spine.post.base import PostBase
-from spine.utils.calib import CalibrationManager
 
 __all__ = ["CalorimetricEnergyProcessor", "CalibrationProcessor"]
 
@@ -23,35 +28,37 @@ class CalorimetricEnergyProcessor(PostBase):
 
     def __init__(
         self,
-        scaling=1.0,
-        shower_fudge=1.0,
-        obj_type="particle",
-        run_mode="reco",
-        truth_dep_mode="depositions",
-    ):
+        scaling: float | str = 1.0,
+        shower_fudge: float | str = 1.0,
+        obj_type: str | Sequence[str] | None = "particle",
+        run_mode: str = "reco",
+        truth_dep_mode: str = "depositions",
+    ) -> None:
         """Stores the ADC to MeV conversion factor.
 
         Parameters
         ----------
-        scaling : Union[float, str], default 1.
+        scaling : float or str, default 1.
             Global scaling factor for the depositions (can be an expression)
-        shower_fudge : Union[float, str], default 1.
+        shower_fudge : float or str, default 1.
             Shower energy fudge factor (accounts for missing cluster energy)
         """
         # Initialize the parent class
         super().__init__(obj_type, run_mode, truth_dep_mode=truth_dep_mode)
 
         # Store the conversion factor
-        self.scaling = scaling
-        if isinstance(self.scaling, str):
-            self.scaling = float(ne.evaluate(self.scaling))
+        self.scaling = (
+            float(ne.evaluate(scaling)) if isinstance(scaling, str) else scaling
+        )
 
         # Store the shower fudge factor
-        self.shower_fudge = shower_fudge
-        if isinstance(self.shower_fudge, str):
-            self.shower_fudge = float(ne.evaluate(self.shower_fudge))
+        self.shower_fudge = (
+            float(ne.evaluate(shower_fudge))
+            if isinstance(shower_fudge, str)
+            else shower_fudge
+        )
 
-    def process(self, data):
+    def process(self, data: Mapping[str, Any]) -> None:
         """Reconstruct the calorimetric KE for each particle in one entry.
 
         Parameters
@@ -87,12 +94,12 @@ class CalibrationProcessor(PostBase):
 
     def __init__(
         self,
-        do_tracking=False,
-        obj_type=("particle", "interaction"),
-        run_mode="reco",
-        truth_point_mode="points",
-        **cfg,
-    ):
+        do_tracking: bool = False,
+        obj_type: str | Sequence[str] | None = ("particle", "interaction"),
+        run_mode: str = "reco",
+        truth_point_mode: str = "points",
+        **cfg: Any,
+    ) -> None:
         """Initialize the calibration manager.
 
         Parameters
@@ -128,7 +135,7 @@ class CalibrationProcessor(PostBase):
 
         self.update_keys(keys)
 
-    def process(self, data):
+    def process(self, data: Mapping[str, Any]) -> None:
         """Apply calibrations to each particle in one entry.
 
         Parameters
@@ -164,9 +171,11 @@ class CalibrationProcessor(PostBase):
 
                 # Apply calibration
                 if not self.do_tracking or part.shape != TRACK_SHP:
-                    depositions = self.calibrator(points, deps, sources, run_id)
+                    cal_points, depositions = self.calibrator(
+                        points, deps, sources, run_id
+                    )
                 else:
-                    depositions = self.calibrator(
+                    cal_points, depositions = self.calibrator(
                         points, deps, sources, run_id, track=True
                     )
 
@@ -176,6 +185,12 @@ class CalibrationProcessor(PostBase):
                 else:
                     setattr(part, self.truth_dep_mode, depositions)
 
+                if self.calibrator.update_points:
+                    if not part.is_truth:
+                        part.points = cal_points
+                    else:
+                        setattr(part, self.truth_point_mode, cal_points)
+                    data[points_key][part.index] = cal_points
                 data[dep_key][part.index] = depositions
                 unass_mask[part.index] = False
 
@@ -183,15 +198,20 @@ class CalibrationProcessor(PostBase):
             unass_index = np.where(unass_mask)[0]
             points = data[points_key][unass_index]
             depositions = data[dep_key][unass_index]
+            sources = None
             if source_key in data:
                 sources = data[source_key][unass_index]
 
-            data[dep_key][unass_index] = self.calibrator(
+            cal_points, depositions = self.calibrator(
                 points, depositions, sources, run_id
             )
+            if self.calibrator.update_points:
+                data[points_key][unass_index] = cal_points
+            data[dep_key][unass_index] = depositions
 
         # If requested, updated the depositions attribute of interactions
         for k in self.interaction_keys:
+            points_key = "points" if not "truth" in k else self.truth_point_key
             dep_key = "depositions" if not "truth" in k else self.truth_dep_key
             for inter in data[k]:
                 # Update depositions for the interaction
@@ -200,3 +220,10 @@ class CalibrationProcessor(PostBase):
                     inter.depositions = depositions
                 else:
                     setattr(inter, self.truth_dep_mode, depositions)
+
+                if self.calibrator.update_points:
+                    points = data[points_key][inter.index]
+                    if not inter.is_truth:
+                        inter.points = points
+                    else:
+                        setattr(inter, self.truth_point_mode, points)

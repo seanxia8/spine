@@ -56,6 +56,7 @@ class ClustGeoNodeEncoder(torch.nn.Module):
         add_value=False,
         add_shape=False,
         add_points=False,
+        random_order=True,
         add_local_dirs=False,
         dir_max_dist=5.0,
         add_local_dedxs=False,
@@ -73,6 +74,9 @@ class ClustGeoNodeEncoder(torch.nn.Module):
             Add the particle semantic type
         add_points : bool, default False
             Add the start/end points of the particles
+        random_order : bool, default True
+            If `True`, randomize the order of the start/end points fetched
+            from labels
         add_local_dirs : bool, default False
             Add the local direction estimates at the start and end points
         dir_max_dist : float, default 5.
@@ -90,6 +94,7 @@ class ClustGeoNodeEncoder(torch.nn.Module):
         self.add_value = add_value
         self.add_shape = add_shape
         self.add_points = add_points
+        self.random_order = random_order
         self.add_local_dirs = add_local_dirs
         self.dir_max_dist = dir_max_dist
         self.add_local_dedxs = add_local_dedxs
@@ -175,7 +180,9 @@ class ClustGeoNodeEncoder(torch.nn.Module):
         # Add the points
         if self.add_points:
             if points is None:
-                points = get_cluster_points_label_batch(data, coord_label, clusts)
+                points = get_cluster_points_label_batch(
+                    data, coord_label, clusts, random_order=self.random_order
+                )
 
             feats = torch.cat((feats, points.tensor), dim=1)
 
@@ -319,19 +326,23 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
     # Alternative allowed names of the edge encoder
     aliases = ("geo",)
 
-    def __init__(self, use_numpy=True):
+    def __init__(self, use_numpy=True, use_legacy_distance=False):
         """Initializes the geometric-based node encoder.
 
         Parameters
         ----------
         use_numpy : bool, default True
             Generate the features on CPU
+        use_legacy_distance : bool, default False
+            Preserve the historical iterative closest-pair behavior if edge
+            features are computed without precomputed closest indexes
         """
         # Initialize the parent class
         super().__init__()
 
         # Store the paramters
         self.use_numpy = use_numpy
+        self.use_legacy_distance = use_legacy_distance
 
     def forward(self, data, clusts, edge_index, closest_index=None, **kwargs):
         """Generate geometric cluster edge features for one batch of data.
@@ -359,7 +370,11 @@ class ClustGeoEdgeEncoder(torch.nn.Module):
         if self.use_numpy:
             # If numpy is to be used, pass it through the Numba function
             feats = get_cluster_edge_features_batch(
-                data, clusts, edge_index, closest_index=closest_index
+                data,
+                clusts,
+                edge_index,
+                closest_index=closest_index,
+                use_legacy_distance=self.use_legacy_distance,
             ).tensor
         else:
             # Otherwise, use the local torch method

@@ -1,5 +1,163 @@
 # Changelog
 
+## [0.15.1] - 2026-07-17
+
+### Fixed
+- **Drawer hovertext ordering**: Preserve the caller-provided attribute order when building reconstructed and truth object hovertext instead of iterating attributes in hash-dependent set order.
+
+## [0.15.0] - 2026-07-17
+
+### Added
+- **Shared module manager**: Add a reusable `ModuleManager` for running ordered analysis and post-processing modules on individual entries and batches.
+- **Repeated module instances**: Allow analysis and post-processing modules to be configured more than once through explicit `name` fields, with deterministic priority ordering and validation of malformed module blocks.
+- **Configuration fragments**: Add `kind: fragment` for reusable, intentionally unversioned configuration pieces. Fragments can be included without missing-metadata warnings, do not register their own component version, and still propagate versions from nested components.
+- **Analysis and post-processing coverage**: Add comprehensive unit coverage for managers, factories, metrics, diagnostics, reconstruction modules, optical and CRT matching, triggers, truth utilities, and CSV output.
+
+### Changed
+- **Analysis and post-processing infrastructure**: Refactor `AnaManager` and `PostManager` around the shared manager implementation, type them directly against their module base classes, and modernize module interfaces and documentation throughout both packages.
+- **Configuration validation**: Preserve caller-provided module configurations and replace configuration-related assertions with explicit `ValueError`, `TypeError`, and `KeyError` exceptions.
+- **GrapPA label points**: Make label-point ordering configurable and improve label-based full-chain aggregation, identity, group assignment, fragmentation, and truth-point selection.
+
+### Fixed
+- **Segmentation and truth propagation**: Correctly expand deghosted segmentation outputs to the original point set and propagate field-corrected coordinates through truth particles, interactions, and reference tensors.
+- **Analysis diagnostics**: Avoid meaningless interaction shape metrics, correct mixed-shape graph indexing and distance lookup, fix detailed ghost scores, and make CSV attribute ordering deterministic.
+- **Optical and CRT matching**: Correct charge-weighted barycenters, optical-coordinate indexing, flash-match score storage, and CRT matching behavior and validation.
+- **Reconstruction edge cases**: Enable proton-to-point shower conversion distances and safely handle interactions without nonempty particles during calorimetric direction reconstruction.
+- **Optional ROOT checks**: Avoid importing ROOT merely to probe optional dependency availability.
+
+## [0.14.2] - 2026-06-30
+
+### Fixed
+- **CVMFS container setup**: Restore LArCV feature flags in `/opt/spine/setup.sh` so unpacked-image runtimes expose PyUtil bindings such as `larcv.fill_3d_voxels`, and make `/opt/spine/check-env.sh` validate that binding explicitly.
+- **Stage-cache writer configuration**: Raise a clear configuration error when `stage_hdf5` is used without `base.split_output: true`.
+- **Writer output directories**: Create configured output directories automatically for HDF5, staged HDF5, and CSV writers.
+- **Staged cache provenance**: Preserve source entry metadata in staged caches and provide a fallback when reading older/minimal stage-cache files without explicit `source_file_entry_index`.
+- **Remote source provenance**: Populate stable source provenance keys for XRootD-streamed inputs using sentinel values when file size and modification time are unavailable.
+
+## [0.14.1] - 2026-06-27
+
+### Fixed
+- **GrapPA inference stability**: Normalize indexed cluster coordinate views before Numba-compiled distance, endpoint, node-feature, and edge-feature helpers so full-chain GrapPA inference no longer fails intermittently on arbitrary-layout arrays in batch jobs.
+- **Regression coverage**: Add focused tests for arbitrary-layout Numba callers in distance helpers and GrapPA cluster/node/edge feature extraction.
+
+## [0.14.0] - 2026-06-26
+
+### Added
+- **Public calibration package**: Promote calibration utilities from `spine.utils.calib` to the top-level `spine.calib` package, with focused coverage for calibration constants, databases, factories, managers, gain, lifetime, transparency, recombination, and field corrections.
+- **SCE field-map calibration**: Add electric-field non-uniformity corrections through `FieldCalibrator` and `FieldMap`, including dense map interpolation, ROOT TH3 map loading, configurable out-of-bounds behavior, detector-volume transforms, and `bin/calib/sce_field_check.py` validation tooling.
+- **Gain calibration functions**: Add `gain_func` support to `GainCalibrator`, allowing NumExpr expressions such as `2.3 * exp(x) - 3` to transform charge arrays directly instead of applying only flat or database-backed gain constants.
+- **DUNE-VD geometry support**: Add DUNE-VD 10 kt geometry metadata and harden geometry parsing for nonterminal version tags in LArSoft/Flow geometry descriptions.
+- **Calorimetric interaction directions**: Add `CalorimetricDirectionProcessor` for charge-weighted interaction direction reconstruction, with separate storage for true and reconstructed interaction direction fields.
+- **Validation and metrics coverage**: Add configurable truth-index selection for cluster metrics, plus tests for calorimetric direction reconstruction, calibration modules, geometry parsing, LArCV helpers, and output validation scripts.
+
+### Changed
+- **Calibration namespace**: Remove the old `spine.utils.calib` namespace in favor of `spine.calib`; update calorimetry, full-chain, and post-processing imports accordingly.
+- **Script organization**: Move utility scripts into domain-specific `bin/calib`, `bin/geo`, `bin/larcv`, and `bin/output` directories with lightweight README files and shared LArCV ROOT tree helpers.
+- **Factory parsing**: Extend module factory parsing to support repeated modules with explicit names while preserving the legacy single-module configuration style.
+
+### Fixed
+- **MCS robustness**: Skip MCS kinetic-energy reconstruction for one-point tracks and prevent `bin_pca` segment PCA from running on one-point chunks, avoiding PCA assertion failures for degenerate track-like objects.
+- **Shared download caches**: Normalize downloaded cache artifacts to group-readable permissions, preserve atomic downloads, and raise clear permission errors when cache directories, lock files, temporary files, or existing cached downloads cannot be accessed.
+- **Field and calibration edge cases**: Add validation around field-map dimensions, bounds handling, calibration constant source selection, and gain function expression inputs so configuration mistakes fail early with actionable errors.
+
+## [0.13.3] - 2026-06-03
+
+### Added
+- **Container runtime setup script**: Add `/opt/spine/setup.sh` and `/opt/spine/check-env.sh` to the published container image so ROOT/LArCV/SPINE runtime environment setup is explicit, testable, and recoverable when unpacked-image runtimes fail to apply the container environment automatically.
+
+## [0.13.2] - 2026-06-02
+
+### Changed
+- **Semantic overlay precedence**: Include the ghost semantic class at the end of the default shape precedence so ghost-inclusive semantic labels can use precedence-based duplicate cleanup safely during overlays.
+- **LArCV overlay configuration**: Add dataset-level `overlay_methods` overrides to `LArCVDataset`, matching `HDF5Dataset`, so products such as `run_info` can use policies like `first`, `match`, or `cat` without changing parser defaults.
+
+### Fixed
+- **Overlay duplicate cleanup**: Preserve aligned feature-only tensors during overlay duplicate cleanup by letting tensors such as `sources` reuse the row selection from an explicit `overlay_reference`, and add sum/average aggregation support for duplicate sparse features.
+- **Manager stopwatch recovery**: Reset active manager-owned stopwatches before new manager calls so exceptions in I/O, model, post-processing, or analysis do not leave watches stuck in a running state.
+
+## [0.13.1] - 2026-06-01
+
+### Added
+- **Joint overlay datasets**: Add backend-agnostic `JointDataset` support for overlay training across independently sampled primary and secondary datasets, plus dedicated joint samplers and loader validation so tuple-based pairing is only used with joint datasets.
+
+### Changed
+- **Dataset documentation and coverage**: Expand dataset-layer docstrings, clarify aligned (`MixedDataset`) versus unaligned (`JointDataset`) composition semantics, and add focused tests for joint dataset construction, pairing, and loader/sampler validation.
+
+### Fixed
+- **On-demand driver usability**: Restore the ability to omit both `iterations` and `epochs` when using the driver and I/O manager in on-demand mode, while still rejecting the ambiguous case where both are specified.
+
+## [0.13.0] - 2026-05-30
+
+### Added
+- **Visualization docs**: Add a dedicated `spine.vis` README covering the reorganized trace, drawer, metric, and layout structure introduced in [#131](https://github.com/DeepLearnPhysics/spine/pull/131).
+- **Driver logging backends**: Add a structured `LogManager` with optional TensorBoard integration and CSV/timing/memory logging support as part of the driver refactor in [#132](https://github.com/DeepLearnPhysics/spine/pull/132).
+- **Index-span metadata**: Add explicit parser payload classes and span-aware batch metadata for flat indexes, index lists, and edge indexes in [#133](https://github.com/DeepLearnPhysics/spine/pull/133).
+
+### Changed
+- **Math package cleanup**: Review and tighten `spine.math` typing, tests, and helper behavior, including the iterative pair-distance path now used by the full-chain regression baseline in [#130](https://github.com/DeepLearnPhysics/spine/pull/130).
+- **Visualization package structure**: Reorganize `spine.vis` into explicit `trace`, `drawer`, `metric`, and `layout` subpackages, preserve direct import exposure through `spine.vis`, and restore comprehensive coverage in [#131](https://github.com/DeepLearnPhysics/spine/pull/131).
+- **Driver and I/O ownership boundaries**: Refactor driver initialization, move batching/unwrapping responsibilities under `spine.io`, introduce an `IOManager`, and separate structured logging concerns through [#132](https://github.com/DeepLearnPhysics/spine/pull/132).
+- **Index batching model**: Replace implicit global index shifts with explicit per-entry spans throughout parsing, collation, overlay, unwrapping, and cached HDF5 index handling in [#133](https://github.com/DeepLearnPhysics/spine/pull/133).
+- **Container/runtime defaults**: Simplify container metadata handling and restore multi-rank training summaries so distributed runs emit one coherent per-rank progress table from the main process.
+
+### Fixed
+- **Closest/farthest pair utilities**: Fix pair-distance helper behavior used by GrapPA feature engineering and align the deterministic full-chain regression reference with the iterative implementation in [#130](https://github.com/DeepLearnPhysics/spine/pull/130).
+- **Visualization regressions**: Fix CI regressions in the reorganized output drawer, restore coverage, and preserve existing behavior after the package shuffle in [#131](https://github.com/DeepLearnPhysics/spine/pull/131).
+- **CLI and runtime polish**: Move banner printing to the CLI, reduce duplicate startup output, improve bin-package typing, and expand coverage around the main runtime and entrypoint helpers as part of [#132](https://github.com/DeepLearnPhysics/spine/pull/132).
+- **Index list semantics**: Preserve list-backed `IndexBatch` behavior for object-array-backed cluster lists, fix downstream PPN cluster access after the span refactor, and require count metadata for HDF5 index parsers where spans must be reconstructed after [#133](https://github.com/DeepLearnPhysics/spine/pull/133).
+- **Distributed training summaries**: Gather per-rank iteration rows onto rank 0 so training logs once again report timing, memory, loss, and accuracy for every process without duplicating the full header block.
+
+## [0.12.4] - 2026-05-18
+
+### Changed
+- **Docker publishing**: Add a persistent Buildx registry cache for published container builds so release-tag builds can reuse expensive dependency layers across workflow runs instead of relying only on GitHub Actions cache scope.
+
+### Fixed
+- **Stored property metadata**: Add missing array metadata for output data derived attributes so values such as `module_ids` and truth direction vectors are correctly classified for scalar expansion and serialization introspection.
+- **Truth particle units**: Correct `TruthParticle.ke` metadata from rest-mass units to kinetic-energy units.
+
+## [0.12.3] - 2026-05-12
+
+### Added
+- **Data attribute introspection**: Add `DataBase.attr_names()` to expose the full valid attribute surface, including derived and serialization-skipped attributes by default.
+
+### Fixed
+- **Output visualization attributes**: Use `DataBase.attr_names()` when validating drawer hover attributes so derived quantities such as `RecoParticle.ke` can be displayed.
+
+## [0.12.2] - 2026-05-12
+
+### Fixed
+- **Truth object units**: Rebuild per-class field metadata caches after multiprocessing worker unpickle so truth particle and interaction coordinates convert from pixel units to detector coordinates correctly during output construction.
+
+## [0.12.1] - 2026-05-11
+
+### Fixed
+- **GrapPA cluster dE/dx**: Normalize mixed coordinate dtypes before anchored distance calls so GrapPA feature engineering no longer fails in Numba when `start` arrives as `float64` and voxel coordinates are `float32`.
+
+## [0.12.0] - 2026-05-10
+
+### Added
+- **Staged HDF5 caching**: Add staged cache readers and writers that support one cache file per source file, per-stage completeness tracking, provenance validation, and staged cache reuse across sequential workflows ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+- **Mixed dataset loading**: Add `MixedDataset` plus staged/flat `HDF5Dataset` support so live LArCV inputs can be aligned with cached HDF5 products in training and inference jobs ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+- **Generic HDF5 parsers**: Add cached-tensor, cached-index, and cached-object parsers for HDF5-backed SPINE products, including feature ablation and cluster-tensor reconstruction support ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+- **Data augmentation**: Add rotation and pixel-jitter augmentation plus broader augmentation test coverage and geometry-aware worker initialization ([#127](https://github.com/DeepLearnPhysics/spine/pull/127)).
+- **Validation tooling**: Update `bin/output_check_valid.py` to prefer staged-cache completeness and provenance metadata when available while preserving legacy fallback checks.
+
+### Changed
+- **I/O package structure**: Reorganize `spine.io` around top-level readers, writers, parsers, datasets, augmentation, collation, overlay, and sampling utilities, replacing the older `core`/`torch` split ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+- **Writers**: Extend HDF5, staged HDF5, and CSV writers with cleaner prefix/suffix/directory handling and driver-facing staged-writer integration ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+- **Documentation**: Refresh the `spine.io` API docs to reflect the new staged-cache and dataset structure, and harden docs builds against missing optional ML dependencies.
+- **Testing**: Expand `spine.io`, augmentation, bin-script, and staged-cache regression coverage substantially; restore full `spine.io` coverage after the refactor ([#127](https://github.com/DeepLearnPhysics/spine/pull/127), [#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+
+### Fixed
+- **GrapPA caching path**: Preserve the standard GrapPA path while supporting cached cluster/edge/feature inputs, and fix related geometric-feature and Numba indexing/reshape issues ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+- **Cluster-label adaptation**: Switch full-chain cluster label adaptation to use `orig_index` provenance instead of dense ghost masks, enabling cached deghosted workflows with evolving segmentation predictions ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+- **Optional imports**: Make optional-dependency proxies and docs builds robust when PyTorch and other heavy dependencies are absent or mocked.
+- **Stage writer stability**: Isolate per-stage schema state correctly so staged cache writes do not leak product definitions across stages ([#128](https://github.com/DeepLearnPhysics/spine/pull/128)).
+
+### Notes
+- **Caching workflow maturity**: This release includes the core staged-caching infrastructure needed for sequential training and inference workflows. The end-to-end full-chain caching-enabled training workflow has not yet been exhaustively validated across every stage and may still require additional integration debugging.
+
 ## [0.11.1] - 2026-04-29
 
 ### Added

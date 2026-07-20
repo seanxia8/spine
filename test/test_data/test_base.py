@@ -9,6 +9,10 @@ import pytest
 from spine.data.base import DataBase, PosDataBase
 from spine.data.decorator import stored_alias, stored_property
 from spine.data.field import FieldMetadata
+from spine.data.out.base import OutBase
+from spine.data.out.fragment import TruthFragment
+from spine.data.out.interaction import InteractionBase
+from spine.data.out.particle import RecoParticle, TruthParticle
 
 
 class SampleParticleType(IntEnum):
@@ -257,6 +261,33 @@ class TestDataBase:
         assert "values=list(len=2)" in repr_str
         assert "SimpleData(" not in repr_str
 
+    def test_setstate_rebuilds_cached_attrs(self):
+        """Test that unpickled objects rebuild class-level cached metadata."""
+
+        @dataclass(eq=False)
+        class StatefulData(DataBase):
+            value: int = 0
+            array: np.ndarray = field(
+                default_factory=lambda: np.array([1.0, 2.0], dtype=np.float32),
+                metadata=FieldMetadata(length=2, dtype=np.float32),
+            )
+
+        _ = StatefulData()
+        StatefulData._attrs_cached = False  # pylint: disable=protected-access
+        StatefulData._fixed_length_attrs = ()  # pylint: disable=protected-access
+
+        restored = object.__new__(StatefulData)
+        restored.__setstate__(
+            {"value": 7, "array": np.array([3.0, 4.0], dtype=np.float32)}
+        )
+
+        assert restored.value == 7
+        assert np.array_equal(restored.array, np.array([3.0, 4.0], dtype=np.float32))
+        assert StatefulData._attrs_cached is True  # pylint: disable=protected-access
+        assert (
+            "array" in StatefulData._fixed_length_attrs
+        )  # pylint: disable=protected-access
+
     def test_array_dtype_casting(self):
         """Test that arrays are cast to correct dtype in __post_init__."""
         obj = ArrayData(position=np.array([1, 2, 3]))  # int array
@@ -353,6 +384,50 @@ class TestDataBase:
         assert "visible" in result
         assert "skip_field" not in result
         assert "lite_skip_field" not in result  # Should be skipped in lite mode
+
+    def test_attr_names_includes_all_attrs_by_default(self):
+        """Test attr_names includes fields, skipped fields and derived attributes."""
+        attrs = DerivedData.attr_names()
+
+        assert "_value" in attrs
+        assert "energy" in attrs
+        assert "ke" in attrs
+
+        skip_attrs = SkipData.attr_names()
+
+        assert "visible" in skip_attrs
+        assert "skip_field" in skip_attrs
+        assert "lite_skip_field" in skip_attrs
+
+    def test_attr_names_can_match_as_dict_keys(self):
+        """Test attr_names can expose the serialization attribute policy."""
+        obj = SkipData()
+
+        attrs = SkipData.attr_names(include_skipped=False)
+
+        assert set(attrs) == set(obj.as_dict())
+        assert "visible" in attrs
+        assert "skip_field" not in attrs
+        assert "lite_skip_field" in attrs
+
+    def test_attr_names_can_match_lite_as_dict_keys(self):
+        """Test attr_names can expose the lite serialization attribute policy."""
+        obj = SkipData()
+
+        attrs = SkipData.attr_names(include_skipped=False, lite=True)
+
+        assert set(attrs) == set(obj.as_dict(lite=True))
+        assert "visible" in attrs
+        assert "skip_field" not in attrs
+        assert "lite_skip_field" not in attrs
+
+    def test_attr_names_can_exclude_derived(self):
+        """Test attr_names can exclude derived properties."""
+        attrs = DerivedData.attr_names(include_derived=False)
+
+        assert "_value" in attrs
+        assert "energy" not in attrs
+        assert "ke" not in attrs
 
     def test_scalar_dict_scalars(self):
         """Test scalar_dict with scalar attributes."""
@@ -462,6 +537,41 @@ class TestDataBase:
         units = obj.field_units
 
         assert units["energy"] == "MeV"
+
+    def test_index_attrs(self):
+        """Test index_attrs property."""
+        obj = IndexData()
+
+        assert obj.index_attrs == ("id", "parent_id", "cluster_ids")
+
+    def test_output_stored_property_metadata(self):
+        """Test stored output properties carry array and unit metadata."""
+        classes = (OutBase, TruthFragment, RecoParticle, TruthParticle, InteractionBase)
+
+        for cls in classes:
+            for name, meta in cls._get_stored_properties().items():
+                if meta.return_type is np.ndarray:
+                    assert meta.dtype is not None, (
+                        f"{cls.__name__}.{name} is an array stored property "
+                        "without dtype metadata"
+                    )
+
+        assert OutBase._get_stored_properties()["module_ids"].dtype is np.int32
+
+        truth_fragment_meta = TruthFragment._get_stored_properties()
+        assert truth_fragment_meta["start_dir"].vector
+        assert truth_fragment_meta["end_dir"].vector
+
+        reco_particle_meta = RecoParticle._get_stored_properties()
+        assert not reco_particle_meta["momentum"].vector
+        assert reco_particle_meta["momentum"].units == "MeV/c"
+
+        truth_particle_meta = TruthParticle._get_stored_properties()
+        assert truth_particle_meta["start_dir"].vector
+        assert truth_particle_meta["end_dir"].vector
+        assert truth_particle_meta["ke"].units == "MeV"
+        assert not truth_particle_meta["reco_momentum"].vector
+        assert truth_particle_meta["reco_momentum"].units == "MeV/c"
 
     def test_value_with_units(self):
         """Test fetching an attribute value alongside its units."""

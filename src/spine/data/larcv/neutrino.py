@@ -16,6 +16,7 @@ from spine.constants import (
     NuInteractionScheme,
 )
 from spine.data.base import PosDataBase
+from spine.data.decorator import stored_property
 from spine.data.field import FieldMetadata
 
 __all__ = ["Neutrino"]
@@ -83,6 +84,8 @@ class Neutrino(PosDataBase):
         Location of the neutrino interaction
     momentum : np.ndarray
         3-momentum of the neutrino at its interaction point
+    dir : np.ndarray
+        Direction of the neutrino at its interaction point
     units : str
         Units in which the position coordinates are expressed
     """
@@ -149,6 +152,22 @@ class Neutrino(PosDataBase):
     )
 
     @property
+    @stored_property(length=3, dtype=np.float32, vector=True)
+    def dir(self) -> np.ndarray:
+        """Converts the initial momentum to a direction vector.
+
+        Returns
+        -------
+        np.ndarray
+            (3) Direction vector
+        """
+        norm = np.linalg.norm(self.momentum)
+        if norm > 0.0:
+            return self.momentum / norm
+
+        return np.full(3, np.nan, dtype=np.float32)
+
+    @property
     def interaction_mode_enum(
         self,
     ) -> LArSoftNuInteractionType | GenieNuInteractionType | None:
@@ -183,7 +202,7 @@ class Neutrino(PosDataBase):
     def from_larcv(
         cls,
         neutrino,
-        interaction_scheme: int | NuInteractionScheme = NuInteractionScheme.LARSOFT,
+        interaction_scheme: int = NuInteractionScheme.LARSOFT,
     ) -> "Neutrino":
         """Builds and returns a Neutrino object from a LArCV Neutrino object.
 
@@ -191,7 +210,7 @@ class Neutrino(PosDataBase):
         ----------
         neutrino : larcv.Neutrino
             LArCV-format neutrino object
-        interaction_scheme : int or NuInteractionScheme, default LARSOFT
+        interaction_scheme : int, default LARSOFT
             Convention used to interpret the interaction mode/type codes.
 
         Returns

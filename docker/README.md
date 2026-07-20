@@ -81,6 +81,34 @@ docker run --gpus all -it --rm \
 This launches the JupyterLab web UI with notebook support enabled. Open the
 URL printed by Jupyter in your browser on the host machine.
 
+### macOS Note for Jupyter
+
+On Apple Silicon Macs, keep the SPINE image running as `linux/amd64`, but do
+that explicitly by passing `--platform=linux/amd64` to `docker run`. For
+example:
+
+```bash
+docker run --rm --platform=linux/amd64 -it \
+  -p 8888:8888 \
+  -v $(pwd):/workspace \
+  ghcr.io/deeplearnphysics/spine:<release> \
+  jupyter lab --ip 0.0.0.0 --port 8888 --no-browser --allow-root
+```
+
+Do
+**not** use the combination of the Apple Virtualization Framework and Rosetta
+when launching Jupyter inside the container. The Jupyter kernel handshake can
+stall in that configuration even though the SPINE CLI itself still runs.
+
+The following macOS Docker Desktop setups have been verified to work for
+Jupyter with the published SPINE image:
+
+- Apple Virtualization Framework **without** Rosetta
+- Docker VMM
+
+This warning is specific to Jupyter notebook/lab use. Regular SPINE CLI usage
+continues to work with either setting.
+
 ### Run Classic Jupyter Notebook
 
 ```bash
@@ -215,6 +243,29 @@ apptainer run --nv \
 ```
 
 When pulled with Apptainer/Singularity, the fully built image is about **5.7 GB**.
+
+### CVMFS / Unpacked Image Environments
+
+Some sites distribute container root filesystems through CVMFS or another
+unpacked-image mechanism instead of asking users to run a local `.sif` file.
+That is a supported distribution model, but the site integration layer is still
+responsible for applying the image environment automatically. Users should not
+normally need to set `PYTHONPATH` or `LD_LIBRARY_PATH` by hand.
+
+The SPINE image includes `/opt/spine/setup.sh` as the canonical fallback recipe
+for the runtime environment, plus `/opt/spine/check-env.sh` for diagnostics. If
+an unpacked-image launch path starts SPINE but cannot import ROOT or LArCV,
+run the following from inside that same unpacked-image environment:
+
+```bash
+source /opt/spine/setup.sh
+/opt/spine/check-env.sh
+python -c "import ROOT, larcv, spine"
+```
+
+If that succeeds, the image contains the expected dependencies and the remaining
+issue is that the CVMFS/OSG launch path is not applying the image environment
+before starting SPINE.
 
 ### HPC SLURM Example
 

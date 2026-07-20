@@ -161,6 +161,22 @@ class DataBase:
                 # Cast the array to the correct type
                 setattr(self, field.name, np.asarray(value, dtype=meta.dtype))
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore pickled instances and rebuild per-class cached metadata.
+
+        Objects transferred across multiprocessing worker boundaries are
+        unpickled without running ``__post_init__`` again. Rebuild the cached
+        class attribute lists in the receiving process so methods relying on
+        them, such as unit conversion, still work.
+
+        Parameters
+        ----------
+        state : dict
+            Pickled instance state
+        """
+        self.__dict__.update(state)
+        type(self)._ensure_cached_attrs()
+
     def __eq__(self, other: object) -> bool:
         """Checks that all attributes of two class instances are the same.
 
@@ -326,6 +342,43 @@ class DataBase:
 
         return return_dict
 
+    @classmethod
+    def attr_names(
+        cls,
+        include_derived: bool = True,
+        include_skipped: bool = True,
+        lite: bool = False,
+    ) -> tuple[str, ...]:
+        """Return the names of valid attributes on this data class.
+
+        Parameters
+        ----------
+        include_derived : bool, default True
+            If `True`, include computed properties marked with
+            `@stored_property` or `@stored_alias`.
+        include_skipped : bool, default True
+            If `True`, include attributes which are skipped by serialization.
+        lite : bool, default False
+            If `True` and `include_skipped` is `False`, apply the lite skip
+            policy used by :meth:`as_dict`.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Tuple of valid attribute names.
+        """
+        cls._ensure_cached_attrs()
+
+        attrs = [field.name for field in fields(cls)]
+        if include_derived:
+            attrs.extend(cls._derived_attrs)
+
+        if not include_skipped:
+            skip_attrs = cls._skip_attrs if not lite else cls._lite_skip_attrs
+            attrs = [attr for attr in attrs if attr not in skip_attrs]
+
+        return tuple(attrs)
+
     def scalar_dict(
         self,
         attrs: list[str] | None = None,
@@ -428,6 +481,18 @@ class DataBase:
             )
 
         return getattr(self, attr), self.field_units.get(attr)
+
+    @property
+    def index_attrs(self) -> tuple[str, ...]:
+        """Return the tuple of index-bearing attributes.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Names of attributes that should be shifted during batching or
+            overlay operations.
+        """
+        return self._index_attrs
 
     @property
     def enum_dicts(self) -> dict[str, dict[str, int]]:
