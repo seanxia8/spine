@@ -79,6 +79,31 @@ class ParticleBase(OutBase):
     is_valid : bool
         Whether this particle counts towards an interaction topology. This
         may be False if a particle is below some defined energy threshold.
+    michel_muon_distance : float
+        For a Michel electron particle, shortest distance to the closest
+        track-like particle in the same interaction (candidate parent muon)
+    muon_match_id : int
+        For a Michel electron particle, ID of the closest track-like particle
+        in the same interaction, if one exists (-1 otherwise)
+    michel_muon_angle : float
+        For a Michel electron particle, angle between its start direction and
+        the end direction of its matched parent muon, in radians
+    primary_depositions : np.ndarray
+        For a Michel electron particle, depositions restricted to the subset
+        of its points which come from fragments classified as Michel-shaped
+        (i.e. the primary ionization near the decay vertex, excluding merged
+        delta ray or shower fragments)
+    primary_depositions_sum : float
+        Sum of `primary_depositions`
+    primary_calo_ke : float
+        Calorimetric KE reconstructed from `primary_depositions` alone (i.e.
+        the ADC-to-MeV-scaled equivalent of `primary_depositions_sum`)
+    corrected_depositions : np.ndarray
+        For a Michel electron matched to a cathode-crossing parent muon,
+        depositions with the electron lifetime correction recomputed at the
+        post-cathode-merge (shifted) position
+    corrected_calo_ke : float
+        Sum of `corrected_depositions`
     """
 
     # Scalar attributes
@@ -88,6 +113,20 @@ class ParticleBase(OutBase):
     is_primary: bool = False
     is_crt_matched: bool = False
     is_valid: bool = True
+
+    michel_muon_distance: float = field(
+        default=np.nan, metadata=FieldMetadata(units="cm")
+    )
+    muon_match_id: int = -1
+    michel_muon_angle: float = field(
+        default=np.nan, metadata=FieldMetadata(units="rad")
+    )
+    corrected_calo_ke: float = field(
+        default=np.nan, metadata=FieldMetadata(units="MeV")
+    )
+    primary_calo_ke: float = field(
+        default=np.nan, metadata=FieldMetadata(units="MeV")
+    )
 
     length: float = field(default=np.nan, metadata=FieldMetadata(units="instance"))
     calo_ke: float = field(default=np.nan, metadata=FieldMetadata(units="MeV"))
@@ -102,6 +141,14 @@ class ParticleBase(OutBase):
     fragment_ids: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.int32),
         metadata=FieldMetadata(dtype=np.int32, cat=True, units="instance"),
+    )
+    primary_depositions: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.float32),
+        metadata=FieldMetadata(dtype=np.float32, cat=True, skip=True),
+    )
+    corrected_depositions: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.float32),
+        metadata=FieldMetadata(dtype=np.float32, cat=True, skip=True),
     )
 
     start_point: np.ndarray = field(
@@ -187,6 +234,18 @@ class ParticleBase(OutBase):
             Number of fragments that make up the particle instance
         """
         return len(self.fragment_ids)
+
+    @property
+    @stored_property
+    def primary_depositions_sum(self) -> float:
+        """Total primary ionization deposition value for a Michel electron.
+
+        Returns
+        -------
+        float
+            Sum of `primary_depositions`
+        """
+        return np.sum(self.primary_depositions).item()
 
 
 @dataclass(eq=False, repr=False)

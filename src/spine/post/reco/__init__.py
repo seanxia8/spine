@@ -8,6 +8,7 @@ from .direction import *
 from .geometry import *
 from .kinematics import *
 from .mcs import *
+from .michel import *
 from .pid import *
 from .points import *
 from .ppn import *
