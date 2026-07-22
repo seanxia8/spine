@@ -335,6 +335,7 @@ class MichelCCEnergyProcessor(PostBase):
             driftv_db=driftv_db,
         )
         self.undo_original_calib = undo_original_calib
+        self.scaling = scaling * shower_fudge
 
     def process(self, data: Mapping[str, Any]) -> None:
         """Recompute the cathode-corrected energy of Michel electrons paired
@@ -409,4 +410,4 @@ class MichelCCEnergyProcessor(PostBase):
                         )
 
                     part.corrected_depositions = corrected.astype(np.float32)
-                    part.corrected_calo_ke = float(np.sum(corrected))
+                    part.corrected_calo_ke = self.scaling * float(np.sum(corrected))
