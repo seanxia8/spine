@@ -233,7 +233,7 @@ class MichelIonizationProcessor(PostBase):
                     if frag.shape == MICHL_SHP
                 ]
                 if not frag_index:
-                    part.primary_depositions = np.empty(0, dtype=np.float32)
+                    part.primary_depositions = np.array([0], dtype=np.float32)
                     part.primary_calo_ke = 0.0
                     continue
 
@@ -289,6 +289,8 @@ class MichelCCEnergyProcessor(PostBase):
         lifetime_db: str | dict | None = None,
         driftv_db: str | dict | None = None,
         undo_original_calib: bool = True,
+        scaling: float | str = 1.0,
+        shower_fudge: float | str = 1.0,
         run_mode: str = "reco",
         truth_point_mode: str = "points",
         truth_dep_mode: str = "depositions",
@@ -310,6 +312,12 @@ class MichelCCEnergyProcessor(PostBase):
             to the Michel's depositions at its pre-shift position, before
             reapplying it at the shifted position. If the depositions were
             never lifetime-corrected in the first place, set to False.
+        scaling : float or str, default 1.
+            Global ADC-to-MeV conversion factor, same
+            convention as the `calo_ke` post-processor
+        shower_fudge : float or str, default 1.
+            Shower energy fudge factor, same
+            convention as the `calo_ke` post-processor.
         run_mode : str, default "reco"
             Whether to run this processor on reconstructed ('reco'), true
             ('truth') or both ('both'/'all') interactions
@@ -335,6 +343,13 @@ class MichelCCEnergyProcessor(PostBase):
             driftv_db=driftv_db,
         )
         self.undo_original_calib = undo_original_calib
+
+        scaling = float(ne.evaluate(scaling)) if isinstance(scaling, str) else scaling
+        shower_fudge = (
+            float(ne.evaluate(shower_fudge))
+            if isinstance(shower_fudge, str)
+            else shower_fudge
+        )
         self.scaling = scaling * shower_fudge
 
     def process(self, data: Mapping[str, Any]) -> None:
@@ -363,9 +378,10 @@ class MichelCCEnergyProcessor(PostBase):
                     if muon is None or not muon.is_cathode_crosser:
                         continue
 
-                    offset = muon.cathode_offset
+                    offset = muon.cathode_offset                    
                     if not np.isfinite(offset) or offset == 0:
                         continue
+                        
 
                     points = self.get_points(part)
                     sources = self.get_sources(part)
@@ -375,6 +391,7 @@ class MichelCCEnergyProcessor(PostBase):
                     depositions = self.get_depositions(part).astype(np.float64)
                     corrected = depositions.copy()
 
+                    #if np.isfinite(offset) and offset > 0.0:
                     # The Michel's points may span more than one chamber if
                     # it happens to straddle the cathode itself; handle each
                     # independently, as `cathode_crosser` does for the muon
@@ -391,12 +408,9 @@ class MichelCCEnergyProcessor(PostBase):
                         chamber_deps = corrected[mask]
 
                         if self.undo_original_calib:
-                            # Reconstruct the pre-shift position, use it to
-                            # find and divide out the stale correction factor
-                            orig_points = chamber_points.copy()
-                            orig_points[:, daxis] -= offset_t
+                            # `chamber_points` is the original (unshifted) position
                             undo_factor = self.calibrator.process(
-                                orig_points,
+                                chamber_points,
                                 np.ones(int(mask.sum())),
                                 self.geo,
                                 cid,
@@ -404,9 +418,12 @@ class MichelCCEnergyProcessor(PostBase):
                             )
                             chamber_deps = chamber_deps / undo_factor
 
-                        # Reapply the correction at the corrected position
+                        # Reapply the correction at the cathode-aligned
+                        # (shifted) position
+                        shifted_points = chamber_points.copy()
+                        shifted_points[:, daxis] += offset_t
                         corrected[mask] = self.calibrator.process(
-                            chamber_points, chamber_deps, self.geo, cid, run_id
+                            shifted_points, chamber_deps, self.geo, cid, run_id
                         )
 
                     part.corrected_depositions = corrected.astype(np.float32)
