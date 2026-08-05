@@ -102,6 +102,8 @@ class ParticleBase(OutBase):
         For a Michel electron matched to a cathode-crossing parent muon,
         depositions with the electron lifetime correction recomputed at the
         post-cathode-merge (shifted) position
+    corrected_depositions_sum : float
+        Sum of `corrected_depositions`
     corrected_calo_ke : float
         Sum of `corrected_depositions`
     """
@@ -144,11 +146,11 @@ class ParticleBase(OutBase):
     )
     primary_depositions: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.float32),
-        metadata=FieldMetadata(dtype=np.float32, cat=True, skip=True),
+        metadata=FieldMetadata(dtype=np.float32, cat=True, lite_skip=True),
     )
     corrected_depositions: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.float32),
-        metadata=FieldMetadata(dtype=np.float32, cat=True, skip=True),
+        metadata=FieldMetadata(dtype=np.float32, cat=True, lite_skip=True),
     )
 
     start_point: np.ndarray = field(
@@ -247,6 +249,17 @@ class ParticleBase(OutBase):
         """
         return np.sum(self.primary_depositions).item()
 
+    @property
+    @stored_property
+    def corrected_depositions_sum(self) -> float:
+        """Total cathode-corrected deposition value for a Michel electron.
+
+        Returns
+        -------
+        float
+            Sum of `corrected_depositions`
+        """
+        return np.sum(self.corrected_depositions).item()
 
 @dataclass(eq=False, repr=False)
 class RecoParticle(ParticleBase, RecoBase):
