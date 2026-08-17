@@ -186,12 +186,13 @@ class AttnGraphSPICEEmbedder(nn.Module):
         # Mean entropy across all available attention heads and layers.
         # _attn: list-of-lists [layer][head] of detached tensors; last dim is
         # the attended sequence treated as a probability distribution.
-        entropies = [-(aw.float().clamp(min=1e-8).log()
-                       * aw.float().clamp(min=1e-8)).sum(-1).mean().item()
-                     for layer_attn in _attn
-                     for aw in layer_attn if aw is not None]
-        result['attn_entropy'] = (sum(entropies) / len(entropies)
-                                  if entropies else float('nan'))
+        if self.decoder.analysis_mode:
+            entropies = [-(aw.float().clamp(min=1e-8).log()
+                        * aw.float().clamp(min=1e-8)).sum(-1).mean().item()
+                        for layer_attn in _attn
+                        for aw in layer_attn if aw is not None]
+            result['attn_entropy'] = (sum(entropies) / len(entropies)
+                                        if entropies else float('nan'))
 
         # If requested, pass the raw output features through final layers
         if not self.use_raw_features:

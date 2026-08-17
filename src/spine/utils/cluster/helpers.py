@@ -277,7 +277,7 @@ def mask_cluster_id(
     x_in: ME.SparseTensor,
     cluster_id: torch.Tensor,
     confidence: torch.Tensor = None,
-    mode: str = "in_cluster"
+    mode: str = "in_cluster",
 ):
     """Create attention mask from cluster assignments.
 
@@ -402,7 +402,7 @@ def create_boundary_mask(coords, cluster_id, neighbor_r=5,
     """
     device = cluster_id.device
     N = cluster_id.shape[0]
-    dist_matrix = torch.cdist(coords, coords)  # (N, N)
+    dist_matrix = torch.cdist(coords, coords)
     within_radius = (dist_matrix <= neighbor_r)
 
     is_boundary = detect_boundary_vox(dist_matrix, cluster_id, neighbor_r)
@@ -411,8 +411,8 @@ def create_boundary_mask(coords, cluster_id, neighbor_r=5,
     not_noise      = (cluster_id >= 0)
     both_not_noise = not_noise.unsqueeze(0) & not_noise.unsqueeze(1)
 
-    is_boundary_i = is_boundary.unsqueeze(1)  # (N, 1)
-    is_boundary_j = is_boundary.unsqueeze(0)  # (1, N)
+    is_boundary_i = is_boundary.unsqueeze(1)
+    is_boundary_j = is_boundary.unsqueeze(0)
 
     allow_attention = (
         ((is_boundary_i | is_boundary_j) & within_radius) | same_cluster
@@ -424,18 +424,14 @@ def create_boundary_mask(coords, cluster_id, neighbor_r=5,
         mask = torch.zeros((N, N), device=device, dtype=torch.float32)
         mask[~allow_attention] = float('-inf')
     else:
-        conf_ij = torch.minimum(
-            confidence.unsqueeze(1),
-            confidence.unsqueeze(0),
-        )  # (N, N)
+        conf_ij = torch.minimum(confidence.unsqueeze(1), confidence.unsqueeze(0))
         mask = torch.zeros((N, N), device=device, dtype=torch.float32)
         blocked = (~allow_attention) & both_not_noise
         mask[blocked] = -(conf_ij[blocked] * mask_scale)
         del conf_ij
 
     del same_cluster, not_noise, both_not_noise, allow_attention
-    del is_boundary_i, is_boundary_j, is_boundary
-
+    del is_boundary_i, is_boundary_j, is_boundary, dist_matrix, within_radius
     return mask
 
 def detect_boundary_vox(dist, cluster_id, radius = 5):
