@@ -14,7 +14,8 @@ import torch.utils.checkpoint as ckpt
 import MinkowskiEngine as ME
 
 from .act_norm import act_factory, norm_factory
-from .blocks import ResNetBlock, AttentionBlock, ClusterAwareAttn
+from .blocks import ResNetBlock, ClusterAwareAttn
+from ..serial.blocks import SerializedAttention
 from .configuration import setup_cnn_configuration
 from spine.utils.cluster.helpers import mask_cluster_id
 
@@ -133,10 +134,6 @@ class UResNetAttnDecoder(torch.nn.Module):
         #                              dimension=self.dim, embed_dim=self.embed_dim,
         #                              num_heads=self.num_heads, lower=self.lower, upper=self.upper)
         self.enable_attention = enable_attention
-        use_hard_mask = getattr(self, "use_hard_mask", False)
-        attn_gain     = getattr(self, "attn_gain", 0.5)
-        analysis_mode = getattr(self, "analysis_mode", False)
-        self.use_hard_mask = use_hard_mask
         self.checkpoint_attn = getattr(self, "checkpoint_attn", True)
         # Initialize decoder
         self.decoding_block = []
@@ -165,11 +162,19 @@ class UResNetAttnDecoder(torch.nn.Module):
         self.decoding_block = torch.nn.Sequential(*self.decoding_block)
         self.decoding_conv = torch.nn.Sequential(*self.decoding_conv)
         if self.enable_attention:
-            self.bn_attn = ClusterAwareAttn(
-                in_channels=top_c, dimension=self.dim,
-                embed_dim=self.embed_dim, num_heads=self.num_heads,
-                use_hard_mask=use_hard_mask, attn_gain=attn_gain,
-                analysis_mode=analysis_mode)
+            if self.use_serial_attn:
+                self.bn_attn = SerializedAttention(
+                    in_channels=top_c, dimension=self.dim,
+                    embed_dim=self.embed_dim, num_heads=self.num_heads,
+                    window_size=self.attn_win_size, order=self.attn_order,
+                    num_bits=self.num_bits, attention_gain=self.attn_gain,
+                    qkv_bias=self.qkv_bias, analysis_mode=self.analysis_mode)
+            else:
+                self.bn_attn = ClusterAwareAttn(
+                    in_channels=top_c, dimension=self.dim,
+                    embed_dim=self.embed_dim, num_heads=self.num_heads,
+                    use_hard_mask=self.use_hard_mask, attn_gain=self.attn_gain,
+                    analysis_mode=self.analysis_mode)
         else:
             self.bn_attn = None
     '''    
@@ -266,38 +271,45 @@ class UResNetAttnDecoder(torch.nn.Module):
             # Apply cluster-aware attention at this decoder level
             if self.bn_attn is not None and cluster_ids is not None and i == len(self.decoding_conv) - 1:
                 torch.cuda.empty_cache()
-                if self.use_hard_mask:
-                    # Hard {0, -inf} binary mask — no confidence weighting.
-                    # Passing confidence=None forces create_*_mask to produce
-                    # the binary mask, which is compatible with PyTorch's
-                    # mem-efficient SDP backend (Flash SDP doesn't support
-                    # arbitrary float additive masks but mem-efficient does).
-                    attn_mask = mask_cluster_id(
-                        x, cluster_ids,
-                        confidence=None,
-                        mode=self.attn_mode
-                    )
-                    if self.checkpoint_attn and self.training:
-                        x, attn_weights = ckpt.checkpoint(
-                            self.bn_attn, x, attn_mask, use_reentrant=False)
+                if not self.use_serial_attn:
+                    if self.use_hard_mask:
+                        # Hard {0, -inf} binary mask — no confidence weighting.
+                        # Passing confidence=None forces create_*_mask to produce
+                        # the binary mask, which is compatible with PyTorch's
+                        # mem-efficient SDP backend (Flash SDP doesn't support
+                        # arbitrary float additive masks but mem-efficient does).
+                        attn_mask = mask_cluster_id(
+                            x, cluster_ids,
+                            confidence=None,
+                            mode=self.attn_mode,
+                        )
+                        if self.checkpoint_attn and self.training:
+                            x, attn_weights = ckpt.checkpoint(
+                                self.bn_attn, x, attn_mask, use_reentrant=False)
+                        else:
+                            x, attn_weights = self.bn_attn(x, attn_mask=attn_mask)
+                        del attn_mask
                     else:
-                        x, attn_weights = self.bn_attn(x, attn_mask=attn_mask)
-                    del attn_mask
-                else:
-                    # Soft cluster-direction path: no mask, Flash-compatible.
-                    if self.checkpoint_attn and self.training:
-                        x, attn_weights = ckpt.checkpoint(
-                            self.bn_attn, x, None, cluster_ids, node_confidence,
-                            use_reentrant=False)
-                    else:
-                        x, attn_weights = self.bn_attn(
-                            x, cluster_ids=cluster_ids, confidence=node_confidence)
-                attn_tensors.append([aw.detach() if aw is not None else None
-                                     for aw in attn_weights])
+                        # Soft cluster-direction path: no mask, Flash-compatible.
+                        if self.checkpoint_attn and self.training:
+                            x, attn_weights = ckpt.checkpoint(
+                                self.bn_attn, x, None, cluster_ids, node_confidence,
+                                use_reentrant=False)
+                        else:
+                            x, attn_weights = self.bn_attn(
+                                x, cluster_ids=cluster_ids, confidence=node_confidence)
 
-                #torch.cuda.synchronize()
-                #vram = torch.cuda.memory_allocated() / (1024 ** 2) - vram  # in MB
-                #print(f"Attn score VRAM: {vram:.2f} MB")
+                else:
+                    if self.checkpoint_attn and self.training:
+                        x, attn_weights = ckpt.checkpoint(
+                            self.bn_attn, x, cluster_ids, use_reentrant=False)
+                    else:
+                        x, attn_weights = self.bn_attn(x, cluster_ids=cluster_ids)
+
+                if attn_weights is not None:
+                    attn_tensors.append([aw.detach() if aw is not None else None for aw in attn_weights])
+                else:
+                    attn_tensors.append(None)
 
             decoder_tensors.append(x)
             torch.cuda.empty_cache()

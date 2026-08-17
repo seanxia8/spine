@@ -14,14 +14,19 @@ def setup_cnn_configuration(
     spatial_size=None, 
     dropout=False,
     lower=(181, 0, 0), upper=(2571, 1056, 5966),
-    attn_win_size=(230, 100, 570),
     embed_dim=256, 
     num_heads=8, 
     attn_gain=0.75,
+    use_serial_attn=False,
     attn_mode='boundary',
     checkpoint_attn=True,
     use_hard_mask=False,
     analysis_mode=False,
+    num_bits=10,
+    attn_order="hilbert",
+    attn_win_size=256,
+    qkv_bias=False,
+    enable_flash=True,
 ):
 
     """Base function for global network parameters (CNN-based models).
@@ -97,7 +102,6 @@ def setup_cnn_configuration(
     self.dropout = dropout
     self.lower = lower
     self.upper = upper
-    self.attn_win_size = attn_win_size
     self.embed_dim = embed_dim
     self.num_heads = num_heads
     self.attn_gain = attn_gain
@@ -106,4 +110,9 @@ def setup_cnn_configuration(
 
     self.use_hard_mask = use_hard_mask
     self.analysis_mode = analysis_mode
-
+    self.use_serial_attn = use_serial_attn
+    self.num_bits = num_bits
+    self.attn_order = attn_order
+    self.attn_win_size = attn_win_size
+    self.qkv_bias = qkv_bias
+    self.enable_flash = enable_flash

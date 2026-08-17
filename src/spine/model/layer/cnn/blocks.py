@@ -11,7 +11,6 @@ import torch.nn.functional as F
 import time as time
 from typing import Optional
 
-
 class ConvolutionBlock(ME.MinkowskiNetwork):
     """Convolution block which operates a sequence of
     two (convolution + nomalization + activation) steps.
@@ -578,7 +577,7 @@ class ClusterAwareAttn(ME.MinkowskiNetwork):
             self._last_head_outputs = []
 
         unique_batches = torch.unique(batch_indices, sorted=True)
-        for b in unique_batches.tolist():
+        for i_b, b in enumerate(unique_batches.tolist()):
             batch_mask = (batch_indices == b)
             batch_Q = Q[batch_mask].unsqueeze(0)  # (1, N_b, embed_dim)
             batch_K = K[batch_mask].unsqueeze(0)
@@ -586,7 +585,7 @@ class ClusterAwareAttn(ME.MinkowskiNetwork):
 
             if self.use_hard_mask:
                 # --- Hard-mask path: float/bool mask, forces math SDP backend ---
-                batch_attn_mask = attn_mask[b]
+                batch_attn_mask = attn_mask[i_b]
                 attn_out, attn_weights = self.mha(
                     batch_Q, batch_K, batch_V,
                     attn_mask=batch_attn_mask,
