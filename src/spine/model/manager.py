@@ -181,6 +181,7 @@ class ModelManager:
                 device_ids=[self.device_id],
                 output_device=self.device_id,
                 find_unused_parameters=find_unused_parameters,
+                broadcast_buffers=False,
             )
 
         # Store the list of input keys to the forward/loss functions. These
@@ -261,6 +262,11 @@ class ModelManager:
         if lr_scheduler is not None:
             self.lr_scheduler = lr_sched_factory(lr_scheduler, self.optimizer)
 
+        # Tracks how many non-skipped sub-batches have contributed gradients
+        # in the current accumulation window; used to normalize correctly when
+        # some sub-batches are skipped (empty events).
+        self._accum_nonzero = 0
+
     def __call__(self, data, iteration=None, epoch=None):
         """Calls the forward (and backward) function on a batch of data.
 
@@ -294,12 +300,23 @@ class ModelManager:
         # If traning run the backward pass and update the weigths
         if self.train:
 
-            assert (
-                "loss" in result
-            ), "Every model must return a `loss` value to be trained."
-            self.watch.start("backward")
-            self.backward(result["loss"], iteration)
-            self.watch.stop("backward")
+            if result.get('skip_backward', False):
+                # Empty batch: no loss to backprop. If this is a step iteration,
+                # flush any gradients accumulated from earlier sub-batches in
+                # the window so they don't bleed into the next window.
+                self.watch.start("backward")
+                self.watch.stop("backward")
+                is_step = (iteration is None or
+                           (iteration + 1) % self.accum_steps == 0)
+                if is_step and hasattr(self, '_accum_nonzero'):
+                    self._flush_accum()
+            else:
+                assert (
+                    "loss" in result
+                ), "Every model must return a `loss` value to be trained."
+                self.watch.start("backward")
+                self.backward(result["loss"], iteration)
+                self.watch.stop("backward")
 
         # If training and at an appropriate iteration, save model state
         if self.train:
@@ -623,7 +640,7 @@ class ModelManager:
             # Apply the model forward
             result = self.net(**input_dict)
             # Compute the loss if one is specified, append results
-            if self.loss_dict:
+            if self.loss_dict and not result.get('skip_backward', False):
                 if not self.time_dependant:
                     result.update(self.loss_fn(**loss_dict, **result))
                 else:
@@ -634,6 +651,20 @@ class ModelManager:
                 result.update(self._log_gradient_conflict(result, iteration))
                 
         return result
+
+    def _flush_accum(self):
+        """Scale accumulated gradients by 1/nonzero_count and step optimizer."""
+        if self._accum_nonzero == 0:
+            return
+        scale = 1.0 / self._accum_nonzero
+        for p in self.net.parameters():
+            if p.grad is not None:
+                p.grad.data.mul_(scale)
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+        self._accum_nonzero = 0
 
     def backward(self, loss, iteration=None):
         """Run the backward step on the model.
@@ -650,18 +681,14 @@ class ModelManager:
             assert iteration is not None, (
                 "Must provide iteration when using gradient accumulation")
 
-        # Run the model backward
-        loss = loss / self.accum_steps
+        # Accumulate unnormalized gradients; normalization is applied at step
+        # time by _flush_accum() so skipped sub-batches are excluded from the
+        # denominator rather than being counted as zeros.
         loss.backward()
+        self._accum_nonzero += 1
 
-        if iteration is None or (iteration+1) % self.accum_steps == 0:
-            # Step the optimizer
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
-
-            # Step the learning rate scheduler
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
+        if iteration is None or (iteration + 1) % self.accum_steps == 0:
+            self._flush_accum()
 
         # If the model has a buffer that needs to be updated, do it after
         # the trainable parameter update

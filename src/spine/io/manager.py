@@ -487,8 +487,10 @@ class IOManager:
             if hasattr(labels, 'numpy'):
                 labels = labels.cpu().numpy()
             labels = np.asarray(labels, dtype=np.int32)
-            for cls in range(int(labels.max()) + 1):
-                data[f'batch_n_cls{cls}'] = int((labels == cls).sum())
+            if labels.size > 0:
+                n_cls = max(int(labels.max()) + 1, 5)
+                for cls in range(n_cls):
+                    data[f'batch_n_cls{cls}'] = int((labels == cls).sum())
 
         return data
 

@@ -573,6 +573,12 @@ class GraphSPICEIter(torch.nn.Module):
         data, seg_label, clust_label, index = self.filter_class(
                 data, seg_label, clust_label)
 
+        # Guard: if mask/crop augmentation emptied every batch entry of tracked
+        # voxels, skip the entire forward pass — the embedder and graph
+        # constructor cannot handle a completely empty SparseTensor.
+        if data.tensor.shape[0] == 0:
+            return {'filter_index': index, 'iter_used': 0, 'skip_backward': True}
+
         # --- Iteration 0: unconditional pass, no cluster feedback ---
         result = self.embedder(data, cluster_id_full=None)
         segmentation_iter0 = result.get('segmentation_iter0')
