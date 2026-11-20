@@ -54,6 +54,7 @@ def norm_dict() -> Registry:
         "batch_norm": sparse.BatchNorm,
         "instance_norm": sparse.InstanceNorm,
         "pixel_norm": normalizations.PixelNorm,
+        "layer_norm": normalizations.LayerNorm,
     }
 
     return norm_layers

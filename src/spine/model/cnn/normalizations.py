@@ -3,8 +3,38 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 
 from spine.model import sparse
+
+
+class LayerNorm(nn.Module):
+    """Apply ``torch.nn.LayerNorm`` across the channels of each active site.
+
+    Unlike batch normalization, there are no running statistics, so training
+    and inference behave identically regardless of batch size.
+
+    Parameters
+    ----------
+    num_features : int
+        Number of feature channels.
+    eps : float, default 1e-5
+        Numerical stability term.
+    elementwise_affine : bool, default True
+        If True, learn a per-channel scale and shift.
+    """
+
+    def __init__(self, num_features, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        self.ln = nn.LayerNorm(
+            num_features, eps=eps, elementwise_affine=elementwise_affine
+        )
+
+    def forward(self, x: sparse.SparseTensor) -> sparse.SparseTensor:
+        return x.replace_features(self.ln(x.F))
+
+    def extra_repr(self) -> str:
+        return f"{self.ln.normalized_shape[0]}, eps={self.ln.eps}"
 
 
 class PixelNorm(torch.nn.Module):

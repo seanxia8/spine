@@ -19,6 +19,7 @@ def setup_cnn_configuration(
     activation: Config = "lrelu",
     norm_layer: Config = "batch_norm",
     spatial_size: int | None = None,
+    dropout: bool = False,
 ) -> None:
     """Store and validate parameters shared by CNN-based models.
 
@@ -52,6 +53,9 @@ def setup_cnn_configuration(
     spatial_size : int, optional
         Input extent in voxels along each spatial axis. Required by operations
         that derive a final pooling kernel or normalize coordinates.
+    dropout : bool, default False
+        Whether UResNet backbones apply ``p=0.2`` sparse dropout after each
+        encoder downsampling and each decoder upsampling (except the last).
 
     Raises
     ------
@@ -81,6 +85,7 @@ def setup_cnn_configuration(
     self.num_input = num_input
     self.allow_bias = allow_bias
     self.spatial_size = spatial_size
+    self.dropout = dropout
 
     self.num_planes = [level * self.num_filters for level in range(1, self.depth + 1)]
     self.act_cfg = activation

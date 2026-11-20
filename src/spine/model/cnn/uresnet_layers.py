@@ -140,6 +140,10 @@ class UResNetEncoder(sparse.Network):
             encoding_convolutions.append(torch.nn.Sequential(*downsample))
         self.encoding_conv = torch.nn.Sequential(*encoding_convolutions)
         self.encoding_block = torch.nn.Sequential(*encoding_blocks)
+        if self.dropout:
+            self.encoding_dropout = torch.nn.ModuleList(
+                sparse.Dropout(0.2) for _ in self.num_planes
+            )
 
     def forward(self, x: sparse.SparseTensor) -> EncoderOutput:
         """Encode a sparse tensor into multi-resolution features.
@@ -161,12 +165,14 @@ class UResNetEncoder(sparse.Network):
 
         x = self.input_layer(x)
         encoder_tensors = [x]
-        for block, downsample in zip(
-            self.encoding_block, self.encoding_conv, strict=True
+        for level, (block, downsample) in enumerate(
+            zip(self.encoding_block, self.encoding_conv, strict=True)
         ):
             x = block(x)
             encoder_tensors.append(x)
             x = downsample(x)
+            if self.dropout:
+                x = self.encoding_dropout[level](x)
 
         return {"encoder_tensors": encoder_tensors, "final_tensor": x}
 
@@ -230,6 +236,10 @@ class UResNetDecoder(sparse.Network):
             decoding_blocks.append(torch.nn.Sequential(*blocks))
         self.decoding_block = torch.nn.Sequential(*decoding_blocks)
         self.decoding_conv = torch.nn.Sequential(*decoding_convolutions)
+        if self.dropout:
+            self.decoding_dropout = torch.nn.ModuleList(
+                sparse.Dropout(0.2) for _ in range(len(self.decoding_conv) - 1)
+            )
 
     def forward(
         self,
@@ -268,6 +278,8 @@ class UResNetDecoder(sparse.Network):
         ):
             encoder_tensor = encoder_tensors[-index - 2]
             x = upsample(x)
+            if self.dropout and index < len(self.decoding_conv) - 1:
+                x = self.decoding_dropout[index](x)
             x = sparse.cat(encoder_tensor, x)
             x = block(x)
             decoder_tensors.append(x)
