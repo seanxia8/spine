@@ -19,6 +19,9 @@ __all__ = [
     "BinaryLogDiceCELoss",
     "BinaryLogDiceCEMincutLoss",
     "BinaryFocalLoss",
+    "DiceLoss",
+    "CEDiceLoss",
+    "FocalLoss",
 ]
 
 Reduction = Literal["none", "mean", "sum"]
@@ -493,3 +496,94 @@ class BinaryFocalLoss(torch.nn.Module):
             out = out * weights
 
         return _reduce_loss(out, self.reduction)
+
+
+class DiceLoss(torch.nn.Module):
+    """Soft Dice loss on sigmoid-activated logits against a one-hot target.
+
+    The Dice coefficient is computed over all elements at once:
+    ``(2 * sum(p[y > 0]) + s) / (sum(p) + sum(y > 0) + s)``.
+    """
+
+    name = "dice"
+
+    def __init__(self, smooth: float = 1e-6) -> None:
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        pred = torch.sigmoid(y_pred)
+        mask_true = y_true > 0
+        intersection = torch.sum(pred[mask_true])
+        union = pred.sum() + mask_true.sum()
+        dice_coefficient = (2 * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice_coefficient
+
+
+class CEDiceLoss(torch.nn.Module):
+    """Cross-entropy plus Dice loss for semantic segmentation.
+
+    Returns the two terms separately, ``(ce, dice)``, so the caller can
+    weight the per-point cross-entropy before adding ``lambda_dice * dice``.
+    """
+
+    name = "ce_dice"
+
+    def __init__(self, reduction: str = "none", lambda_dice: float = 0.5) -> None:
+        super().__init__()
+        self.ce_loss = torch.nn.CrossEntropyLoss(reduction=reduction)
+        self.dice_loss = DiceLoss()
+        self.lambda_dice = lambda_dice
+        self.reduction = reduction
+
+    def forward(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ce_loss = self.ce_loss(logits, targets)
+        one_hot = torch.nn.functional.one_hot(targets, num_classes=logits.shape[1])
+        return ce_loss, self.dice_loss(logits, one_hot.float())
+
+
+class FocalLoss(torch.nn.Module):
+    """Multi-class focal loss with the interface of ``CrossEntropyLoss``.
+
+    Parameters
+    ----------
+    gamma : float, default 2.0
+        Focusing parameter.
+    alpha : float or sequence of float, optional
+        Scalar or per-class weight applied to the loss.
+    reduction : str, default 'none'
+        One of 'none', 'mean' or 'sum'.
+    """
+
+    name = "focal_loss"
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float | list[float] | None = None,
+        reduction: str = "none",
+    ) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = _validate_reduction(reduction)
+        if alpha is None:
+            self.alpha = None
+        else:
+            self.register_buffer(
+                "alpha", torch.atleast_1d(torch.tensor(alpha, dtype=torch.float32))
+            )
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        logpt = torch.nn.functional.log_softmax(logits, dim=1)
+        pt = logpt.exp()
+        logpt = logpt.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = pt.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        loss = -((1 - pt).pow(self.gamma)) * logpt
+        if self.alpha is not None:
+            alpha = self.alpha if self.alpha.numel() == 1 else self.alpha[targets]
+            loss = alpha * loss
+
+        return _reduce_loss(loss, self.reduction)

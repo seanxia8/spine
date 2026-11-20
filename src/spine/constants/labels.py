@@ -27,6 +27,7 @@ __all__ = [
     "PID_TO_PDG",
     "SHP_TO_PID",
     "SHP_TO_PRIMARY",
+    "UPWEIGHT_METHOD",
 ]
 
 
@@ -123,4 +124,23 @@ SHP_TO_PRIMARY = {
     int(ParticleShape.TRACK): (0, 1),
     int(ParticleShape.DELTA): (0,),
     int(ParticleShape.MICHEL): (0,),
+}
+
+# UResNet upweighting method aliases
+# -----------------------------------
+# Maps string names (in various capitalizations) to integer method codes:
+#   0 = vertex,   1 = instance,   2 = class
+UPWEIGHT_METHOD = {
+    "vertex": 0,
+    "Vertex": 0,
+    "VERTEX": 0,
+    "V": 0,
+    "instance": 1,
+    "Instance": 1,
+    "INSTANCE": 1,
+    "I": 1,
+    "class": 2,
+    "Class": 2,
+    "CLASS": 2,
+    "C": 2,
 }
