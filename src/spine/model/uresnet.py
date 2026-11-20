@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from spine.constants import BATCH_COL, COORD_COLS, GHOST_SHP, VALUE_COL
+from spine.constants import BATCH_COL, COORD_COLS, GHOST_SHP, VALUE_COL, UPWEIGHT_METHOD
 from spine.data import TensorBatch
 
 from spine.utils.logger import logger
