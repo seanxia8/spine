@@ -17,7 +17,7 @@ EXAMPLE_CONFIGS = [
 MODEL_CONFIGS = {
     "full_chain": CONFIG_DIR / "full_chain" / "full_chain_train.yaml",
     "graph_spice": CONFIG_DIR / "graph_spice" / "graph_spice_train.yaml",
-    "graph_spice_iter": CONFIG_DIR / "graph_spice" / "graph_spice_iter_train.yaml",
+    "graph_spice_iter": CONFIG_DIR / "graph_spice" / "graph_spice_iter_2pass.yaml",
     "grappa_inter": CONFIG_DIR / "grappa_inter" / "grappa_inter_train.yaml",
     "grappa_shower": CONFIG_DIR / "grappa_shower" / "grappa_shower_train.yaml",
     "grappa_track": CONFIG_DIR / "grappa_track" / "grappa_track_train.yaml",

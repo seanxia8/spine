@@ -1,25 +1,30 @@
-# Iterative Graph-SPICE training configuration.
+# Iterative Graph-SPICE: single-pass baseline, no attention feedback.
 #
-# Each refinement pass feeds the previous pass's clusters back into the
-# embedder, whose decoder attends within those clusters. Set
-# io.loader.dataset.file_keys and the output paths before launching a job.
+# Same network, data and graph as graph_spice_iter_2pass.yaml, but the
+# embedder runs once and its decoder attention is not built. Only the
+# clustered shapes are embedded: the true semantics (seg_label) remove
+# low-energy deposits before the network. See README_graph_spice_iter.md.
+#
+# Set io.loader.dataset.file_keys and the output paths before launching, e.g.
+#   python3 bin/run.py -c config/graph_spice/graph_spice_iter_1pass.yaml \
+#     --world-size 4 --log-dir <dir> --weight-prefix <dir>/snapshot
 
 base:
   world_size: 1
-  epochs: 25.0
+  epochs: 40.0
   seed: 0
   unwrap: false
-  log_dir: logs/graph_spice_iter/train
+  log_dir: logs/graph_spice_iter_1pass
   log_step: 8
   # metrics:
   #   wandb:
   #     project: spine-graph-spice-iter
-  #     name: graph_spice_iter
+  #     name: graph_spice_iter_1pass
   #     tags: [iterative, attention, graph_spice]
   #     run_dir: wandb
 
 train:
-  weight_prefix: weights/graph_spice_iter/snapshot
+  weight_prefix: weights/graph_spice_iter_1pass/snapshot
   save_epoch: 1.0
   accum_steps: 4
   optimizer:
@@ -28,7 +33,7 @@ train:
 
 io:
   loader:
-    minibatch_size: 64
+    minibatch_size: 16  # per GPU: 4 GPUs x 16 = 64 events per step
     shuffle: false
     num_workers: 8
     collate_fn: all
@@ -66,14 +71,17 @@ model:
     clust_label: clust_label
   modules:
     graph_spice:
-      shapes: [shower, track, michel, delta]
+      shapes: [shower, track, michel, delta]  # low-energy deposits excluded
+      filter_input: true  # embed only the shapes above (seg_label gating)
+      use_pred_sem_filter: false  # true: gate with predicted semantics after warmup
+      pred_sem_filter_warmup_steps: 20000
       use_raw_features: true
       invert: true
       make_clusters: false
-      n_iterations: 2  # 1 = single-pass baseline, 2 = one refinement
-      use_attention: true  # false = iterate without attention (ablation)
-      use_confidence_mask: true
-      track_iter_metrics: true  # per-iteration clustering metrics
+      n_iterations: 1  # 1 = single pass, 2 = one feedback
+      use_attention: false  # no feedback: decoder attention not built
+      use_confidence_mask: false  # hard in/out-of-cluster mask
+      track_iter_metrics: true
       log_step: 8  # should match base.log_step
       embedder:
         spatial_embedding_dim: 3
@@ -84,11 +92,11 @@ model:
         num_classes: 5
         uresnet_attn:
           num_input: 4  # 1 feature + 3 normalized coordinates
-          filters: 32
+          filters: 64
           input_kernel: 5
           depth: 5
           reps: 2
-          spatial_size: 768
+          spatial_size: 768  # image size in voxels, normalizes the coordinates
           allow_bias: false
           embed_dim: 256
           num_heads: 8
@@ -98,7 +106,7 @@ model:
           use_serial_attn: false
           attn_mode: boundary
           use_hard_mask: true
-          checkpoint_attn: true
+          checkpoint_attn: false  # true trades ~2x attention compute for memory
           activation:
             provider: lrelu
             negative_slope: 0.33
@@ -108,14 +116,15 @@ model:
             momentum: 0.01
       kernel:
         provider: bilinear
-        num_features: 32
+        num_features: 64  # must match uresnet_attn.filters
       constructor:
         edge_threshold: 0.1
         min_size: 3
         label_edges: true
         graph:
-          provider: knn
-          k: 5
+          provider: radius
+          r: 1.9  # voxels: all 26 lattice neighbors
+          max_num_neighbors: 32
         orphan:
           mode: radius
           radius: 1.9

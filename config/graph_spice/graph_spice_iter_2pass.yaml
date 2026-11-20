@@ -1,0 +1,140 @@
+# Iterative Graph-SPICE: two passes, one attention-mask feedback.
+#
+# Pass 0 embeds the voxels and clusters them; pass 1 re-runs the embedder with
+# its decoder attention masked by the pass-0 clusters. Only the clustered
+# shapes are embedded: the true semantics (seg_label) remove low-energy
+# deposits before the network. The single-pass baseline is
+# graph_spice_iter_1pass.yaml; see README_graph_spice_iter.md for every knob.
+#
+# Set io.loader.dataset.file_keys and the output paths before launching, e.g.
+#   python3 bin/run.py -c config/graph_spice/graph_spice_iter_2pass.yaml \
+#     --world-size 4 --log-dir <dir> --weight-prefix <dir>/snapshot
+
+base:
+  world_size: 1
+  epochs: 40.0
+  seed: 0
+  unwrap: false
+  log_dir: logs/graph_spice_iter_2pass
+  log_step: 8
+  # metrics:
+  #   wandb:
+  #     project: spine-graph-spice-iter
+  #     name: graph_spice_iter_2pass
+  #     tags: [iterative, attention, graph_spice]
+  #     run_dir: wandb
+
+train:
+  weight_prefix: weights/graph_spice_iter_2pass/snapshot
+  save_epoch: 1.0
+  accum_steps: 4
+  optimizer:
+    provider: Adam
+    lr: 0.001
+
+io:
+  loader:
+    minibatch_size: 16  # per GPU: 4 GPUs x 16 = 64 events per step
+    shuffle: false
+    num_workers: 8
+    collate_fn: all
+    sampler:
+      provider: random_sequence
+      seed: 0
+    dataset:
+      provider: larcv
+      file_keys: null
+      schema:
+        data:
+          provider: sparse3d
+          sparse_event: sparse3d_pcluster
+        seg_label:
+          provider: sparse3d
+          sparse_event: sparse3d_pcluster_semantics
+        clust_label:
+          provider: cluster3d
+          cluster_event: cluster3d_pcluster
+          sparse_semantics_event: sparse3d_pcluster_semantics
+          clean_data: true
+          break_clusters: true
+          particle_info:
+            particle_event: particle_pcluster
+
+model:
+  provider: graph_spice_iter
+  weight_path: null
+  network_input:
+    data: data
+    seg_label: seg_label
+    clust_label: clust_label
+  loss_input:
+    seg_label: seg_label
+    clust_label: clust_label
+  modules:
+    graph_spice:
+      shapes: [shower, track, michel, delta]  # low-energy deposits excluded
+      filter_input: true  # embed only the shapes above (seg_label gating)
+      use_pred_sem_filter: false  # true: gate with predicted semantics after warmup
+      pred_sem_filter_warmup_steps: 20000
+      use_raw_features: true
+      invert: true
+      make_clusters: false
+      n_iterations: 2  # 1 = single pass, 2 = one feedback
+      use_attention: true
+      use_confidence_mask: false  # hard in/out-of-cluster mask
+      track_iter_metrics: true
+      log_step: 8  # should match base.log_step
+      embedder:
+        spatial_embedding_dim: 3
+        feature_embedding_dim: 16
+        occupancy_mode: softplus
+        covariance_mode: softplus
+        predict_semantics: true
+        num_classes: 5
+        uresnet_attn:
+          num_input: 4  # 1 feature + 3 normalized coordinates
+          filters: 64
+          input_kernel: 5
+          depth: 5
+          reps: 2
+          spatial_size: 768  # image size in voxels, normalizes the coordinates
+          allow_bias: false
+          embed_dim: 256
+          num_heads: 8
+          attn_gain: 0.5
+          # Full attention per event (boundary mask) or windowed attention
+          # along a Hilbert curve (use_serial_attn: true, attn_win_size: 256)
+          use_serial_attn: false
+          attn_mode: boundary
+          use_hard_mask: true
+          checkpoint_attn: false  # true trades ~2x attention compute for memory
+          activation:
+            provider: lrelu
+            negative_slope: 0.33
+          norm_layer:
+            provider: batch_norm
+            eps: 0.0001
+            momentum: 0.01
+      kernel:
+        provider: bilinear
+        num_features: 64  # must match uresnet_attn.filters
+      constructor:
+        edge_threshold: 0.1
+        min_size: 3
+        label_edges: true
+        graph:
+          provider: radius
+          r: 1.9  # voxels: all 26 lattice neighbors
+          max_num_neighbors: 32
+        orphan:
+          mode: radius
+          radius: 1.9
+          iterate: true
+          assign_all: true
+    graph_spice_loss:
+      provider: edge
+      loss: binary_log_dice_ce
+      evaluate_clustering_metrics: true
+      w_edge: 1.0
+      w_seg_iter0: 0.3
+      w_seg_iter_last: 0.5
