@@ -4,20 +4,13 @@ import torch
 
 from spine.model import sparse
 
-try:
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.backends.cuda.enable_math_sdp(True)
-except Exception:
-    pass
+from .base import encode
+from .utils import bincount2offset
 
 try:
-    import flash_attn
+    from flash_attn import flash_attn_varlen_qkvpacked_func
 except ImportError:
-    flash_attn = None
-
-from .base import decode, encode
-from .utils import bincount2offset, offset2bincount
+    flash_attn_varlen_qkvpacked_func = None
 
 __all__ = [
     "SerializedAttention",
@@ -25,6 +18,42 @@ __all__ = [
 
 
 class SerializedAttention(sparse.Network):
+    """Cluster-restricted attention along a space-filling curve.
+
+    Voxels are sorted by batch entry, then cluster, then position along a
+    Hilbert (or Z-order) curve, and attend only within their cluster. With
+    ``flash_attn`` available, each (entry, cluster) is one variable-length
+    sequence; otherwise the sorted sequence is cut into windows of
+    ``window_size`` tokens with a cluster mask. The output is a gated
+    residual: ``x + gate * attention(x)``.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input feature channels
+    embed_dim : int
+        Attention embedding dimension
+    num_heads : int
+        Number of attention heads
+    scale : float, optional
+        Softmax scale, ``head_dim ** -0.5`` by default
+    qkv_bias : bool, default False
+        Whether the QKV projection has a bias
+    window_size : int, default -1
+        Tokens per window for the non-flash path (must then be positive)
+    dimension : int, default 3
+        Number of spatial dimensions
+    order : str, default 'hilbert'
+        Serialization curve, ``hilbert`` or ``z``
+    num_bits : int, default 8
+        Bits per coordinate of the curve code
+    attention_gain : float, default 0.5
+        Initial value of the residual gate
+    analysis_mode : bool, default False
+        If `True`, also return the attention update for analysis
+    enable_flash : bool, default True
+        Use ``flash_attn`` when it is installed
+    """
 
     def __init__(
         self,
@@ -57,44 +86,61 @@ class SerializedAttention(sparse.Network):
         self.out_proj = torch.nn.Linear(embed_dim, in_channels, bias=False)
 
         self.gate = torch.nn.Parameter(torch.tensor(attention_gain, requires_grad=True))
-        self.enable_flash = enable_flash and (flash_attn is not None)
+        self.enable_flash = (
+            enable_flash and flash_attn_varlen_qkvpacked_func is not None
+        )
 
         if not self.enable_flash:
+            if window_size < 1:
+                raise ValueError(
+                    "Windowed serialized attention (no flash_attn) requires a "
+                    f"positive `window_size`, got {window_size}."
+                )
             self.mha = torch.nn.MultiheadAttention(
                 embed_dim, num_heads, batch_first=True
             )
 
     def cluster_hilbert_order(
-        self,
-        coords: torch.Tensor,
-        cluster_ids: torch.Tensor,
-        batch_ids: torch.Tensor,
-        num_bits: int = 8,
-    ):
-        """
-        coords:      (N, 3) integer voxel coords
-        cluster_ids: (N,)   integer, -1 = noise
-        batch_ids:   (N,)   integer batch index (coords[:, 0])
-        returns:     (N,)   argsort indices — batch → cluster → Hilbert
+        self, coords: torch.Tensor, cluster_ids: torch.Tensor, batch_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Order voxels by batch entry, then cluster, then curve position.
+
+        Parameters
+        ----------
+        coords : torch.Tensor
+            (N, D) integer voxel coordinates
+        cluster_ids : torch.Tensor
+            (N,) cluster assignment, -1 for unclustered voxels
+        batch_ids : torch.Tensor
+            (N,) batch entry index
+
+        Returns
+        -------
+        torch.Tensor
+            (N,) sorting permutation
         """
         coords_shifted = coords - coords.min(dim=0).values
-        coords_shifted = coords_shifted.clamp(0, 2**num_bits - 1)
+        coords_shifted = coords_shifted.clamp(0, 2**self.num_bits - 1)
+        code = encode(coords_shifted, depth=self.num_bits, order=self.order)
 
-        h = encode(coords_shifted, depth=num_bits, order=self.order)  # (N,) int64
-
+        # Unclustered voxels form one extra cluster
         cid = cluster_ids.clone()
         cid[cid < 0] = int(cid.max()) + 1
 
-        offset_h = 2 ** (
-            self.num_dims * self.num_bits
-        )  # 2^24 for num_bits=8, num_dims=3
+        offset_h = 2 ** (self.num_dims * self.num_bits)
         n_cid = int(cid.max()) + 2
-        sort_key = batch_ids.long() * (n_cid * offset_h) + cid.long() * offset_h + h
+        sort_key = batch_ids.long() * (n_cid * offset_h) + cid.long() * offset_h + code
 
         return sort_key.argsort()
 
     @torch.no_grad()
     def get_padding_and_inverse(self, coords):
+        """Pad each batch entry to a multiple of ``window_size`` tokens.
+
+        Returns the padded-to-real gather index, the real-to-padded scatter
+        index and the window boundaries. Padding tokens repeat the matching
+        position of the previous window (or the first token of a short entry).
+        """
         batch_indices = coords[:, 0]
         bincount = torch.bincount(batch_indices.long())
         if self.window_size == -1:
@@ -104,9 +150,6 @@ class SerializedAttention(sparse.Network):
             ).int()
             return None, None, cu_seqlens
 
-        # Round up every batch element to the next multiple of window_size.
-        # The old code only padded when bincount[i] > window_size, leaving
-        # smaller counts unaligned and making .view(n_win, K) fail.
         bincount_pad = (
             torch.div(
                 bincount + self.window_size - 1, self.window_size, rounding_mode="trunc"
@@ -150,28 +193,34 @@ class SerializedAttention(sparse.Network):
         return pad, unpad, cu_seqlens
 
     def forward(
-        self, x: sparse.SparseTensor, cluster_ids: torch.Tensor = None, **kwargs
-    ):
-        """Forward pass.
+        self, x: sparse.SparseTensor, cluster_ids: torch.Tensor | None = None
+    ) -> tuple[sparse.SparseTensor, torch.Tensor | None]:
+        """Attend within clusters along the serialization curve.
+
         Parameters
         ----------
         x : sparse.SparseTensor
-            Input sparse tensor.
-        cluster_ids : torch.Tensor
-            Cluster IDs for each voxel.
+            Input sparse tensor
+        cluster_ids : torch.Tensor, optional
+            (N,) cluster assignment of each voxel. Without it, ``x`` is
+            returned unchanged.
+
+        Returns
+        -------
+        sparse.SparseTensor
+            Updated sparse tensor
+        torch.Tensor or None
+            Attention update ``(N, C)`` in analysis mode, `None` otherwise
         """
+        if cluster_ids is None:
+            return x, None
 
         feats = x.F
         coords = x.C
-
         delta = torch.zeros_like(feats)
-
-        if cluster_ids is not None:
-            serial_order = self.cluster_hilbert_order(
-                coords[:, 1:], cluster_ids, coords[:, 0], self.num_bits
-            )
-        else:
-            return x
+        serial_order = self.cluster_hilbert_order(
+            coords[:, 1:], cluster_ids, coords[:, 0]
+        )
 
         H = self.num_heads
         E = self.embed_dim  # attention space (qkv_proj output / H = head_dim)
@@ -182,8 +231,6 @@ class SerializedAttention(sparse.Network):
             # No windowing or padding: varlen handles variable-length sequences natively
             # and stores only O(N) log-sum-exp statistics for the backward, avoiding the
             # O(n_win·H·K²) attention-weight matrix that math SDP materialises.
-            from flash_attn import flash_attn_varlen_qkvpacked_func
-
             N = feats.shape[0]
             feat_sorted = feats[serial_order]  # (N, C)
             qkv = self.qkv_proj(feat_sorted)  # (N, 3*E)

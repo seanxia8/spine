@@ -602,9 +602,7 @@ class SegmentationLoss(torch.nn.Module):
             (N) Array of weights associated with each point
         """
         labels = seg_label.values.torch_tensor().long()
-        counts = torch.empty(self.num_classes, dtype=torch.long, device=labels.device)
-        for c in range(self.num_classes):
-            counts[c] = torch.sum(labels == c).item()
+        counts = torch.bincount(labels, minlength=self.num_classes)[: self.num_classes]
         class_weight = torch.ones(
             len(counts), dtype=torch.float32, device=labels.device
         )

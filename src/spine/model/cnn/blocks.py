@@ -332,6 +332,36 @@ class ResNetBlock(sparse.Network):
 
 
 class ClusterAwareAttn(sparse.Network):
+    """Full per-event attention conditioned on predicted clusters.
+
+    Two conditioning modes are supported:
+
+    - Hard mask (``use_hard_mask=True``): multi-head attention with an
+      additive per-event mask built by :func:`mask_cluster_id`
+    - Soft (``use_hard_mask=False``): no mask; the confidence-gated cluster
+      centroid direction is added to Q and K, then single-head scaled
+      dot-product attention runs over the full embedding (Flash-compatible)
+
+    The output is a gated residual ``x + sigmoid(gate) * out_proj(attn)``.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input feature channels
+    embed_dim : int, default 256
+        Attention embedding dimension
+    num_heads : int, default 4
+        Number of heads of the hard-mask attention
+    dimension : int, default 3
+        Number of spatial dimensions
+    use_hard_mask : bool, default False
+        Select the hard-mask (True) or soft (False) conditioning
+    attn_gain : float, default 0.5
+        Scale of the cluster direction added in the soft mode
+    analysis_mode : bool, default False
+        Return per-head attention weights (hard mode) for analysis
+    """
+
     def __init__(
         self,
         in_channels,
@@ -344,16 +374,16 @@ class ClusterAwareAttn(sparse.Network):
     ):
         super().__init__(dimension)
 
-        assert (
-            in_channels % num_heads == 0
-        ), f"in_channels ({in_channels}) must be divisible by num_heads ({num_heads})"
+        if in_channels % num_heads != 0:
+            raise ValueError(
+                f"`in_channels` ({in_channels}) must be divisible by "
+                f"`num_heads` ({num_heads})."
+            )
 
         self.in_channels = in_channels
         self.num_heads = num_heads
         self.embed_dim = embed_dim
         self.head_dim = embed_dim // num_heads
-        # use_hard_mask=True  → original float/bool mask path (back-compat)
-        # use_hard_mask=False → soft cluster-direction bias in Q/K (Flash-compatible)
         self.use_hard_mask = use_hard_mask
         self.attn_gain = attn_gain
 
@@ -363,26 +393,15 @@ class ClusterAwareAttn(sparse.Network):
         self.v_proj = sparse.Linear(in_channels, embed_dim)
         self.out_proj = sparse.Linear(embed_dim, in_channels)
 
-        # Used only for hard-mask path
+        # Only used by the hard-mask path, always built to keep checkpoints compatible
         self.mha = torch.nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
         # Learnable gate for attention contribution
         self.gate = torch.nn.Parameter(torch.tensor(0.5))
 
-        # When True, attention weights are returned so attn_entropy can be logged.
-        # Disables Flash/mem-efficient SDP (need_weights=True is incompatible).
+        # Returning attention weights disables the fused SDP kernels
         self.analysis_mode = analysis_mode
         self._last_head_outputs: list | None = None
-
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            # Keep math SDP enabled as a fallback — disabling it causes
-            # "No available kernel" when Flash and mem-efficient both reject
-            # the input (specific head dim, sequence length, dtype, etc.).
-            torch.backends.cuda.enable_math_sdp(True)
-        except Exception:
-            pass
 
     def _apply_cluster_direction(self, Q, K, cluster_ids, confidence):
         """Add confidence-gated cluster centroid direction to Q and K.

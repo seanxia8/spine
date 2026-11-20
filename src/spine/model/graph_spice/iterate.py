@@ -513,26 +513,6 @@ class GraphSPICEIter(torch.nn.Module):
             cluster_labels,
         )
 
-        # Single-pass baseline: no graph feedback
-        if self.n_iter == 1:
-            if self.make_clusters or self.cluster_semantic_pool:
-                with torch.no_grad():
-                    clusts, clust_shapes = self.constructor.fit_predict(graph)
-                if self.make_clusters:
-                    result["clusts"] = clusts
-                    result["clust_shapes"] = clust_shapes
-            if do_metrics and "node_label" in graph:
-                result.update(self._final_metrics(result, graph, seg_label))
-            result.update(graph)
-            result.update({"iter_used": 1, "filter_index": index})
-            if self.cluster_semantic_pool:
-                segmentation_iter0 = self._pool_semantics(
-                    segmentation_iter0, graph["node_pred"]
-                )
-            if segmentation_iter0 is not None:
-                result["segmentation_iter0"] = segmentation_iter0
-            return result
-
         # Iterations 1 .. n_iter - 1: cluster-conditioned refinement
         intermediate_metrics: dict[str, float] = {}
         for k in range(1, self.n_iter):
@@ -587,17 +567,24 @@ class GraphSPICEIter(torch.nn.Module):
                 use_union_graph=use_union,
             )
 
-        if self.make_clusters:
+        # Semantic pooling only applies to the single-pass baseline
+        pool = self.cluster_semantic_pool and self.n_iter == 1
+        if self.make_clusters or pool:
             with torch.no_grad():
                 clusts, clust_shapes = self.constructor.fit_predict(graph)
-            result["clusts"] = clusts
-            result["clust_shapes"] = clust_shapes
+            if self.make_clusters:
+                result["clusts"] = clusts
+                result["clust_shapes"] = clust_shapes
 
         if do_metrics and "node_label" in graph:
             result.update(self._final_metrics(result, graph, seg_label))
 
         result.update(graph)
         result.update({"iter_used": self.n_iter, "filter_index": index})
+        if pool:
+            segmentation_iter0 = self._pool_semantics(
+                segmentation_iter0, graph["node_pred"]
+            )
         if segmentation_iter0 is not None:
             result["segmentation_iter0"] = segmentation_iter0
         result.update(intermediate_metrics)
