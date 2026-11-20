@@ -12,7 +12,9 @@ from torch_scatter import scatter_add, scatter_mean
 from spine.constants import DELTA_SHP, MICHL_SHP, SHOWR_SHP, TRACK_SHP
 from spine.constants.factory import enum_factory
 from spine.data import ClusterLabelBatch, IndexBatch, TensorBatch
+from spine.model.cnn.uresnet_attn_layers import split_attn_config
 from spine.model.common.factories import loss_fn_factory
+from spine.model.uresnet.ppn.ppn import PPN, PPNLoss
 
 from ..registry import ModelSpec
 from .attn_embedder import AttnGraphSPICEEmbedder
@@ -171,6 +173,9 @@ class GraphSPICEIter(torch.nn.Module):
         cluster_semantic_pool: bool = False,
         use_pred_sem_filter: bool = False,
         pred_sem_filter_warmup_steps: int = 20000,
+        filter_input: bool = True,
+        ppn: dict[str, Any] | None = None,
+        ppn_source: str = "iter0",
     ) -> None:
         """Initialize the underlying modules.
 
@@ -219,6 +224,17 @@ class GraphSPICEIter(torch.nn.Module):
             graphs with the predicted semantics instead of the true labels.
         pred_sem_filter_warmup_steps : int, default 20000
             Forward passes before switching to predicted-semantics gating.
+        filter_input : bool, default True
+            Restrict the input to the clustered shapes before embedding. With
+            `False`, every voxel is embedded, the semantic head learns all
+            classes (requires ``predict_semantics``) and the per-shape graphs
+            are gated by predicted semantics whenever no labels are given.
+        ppn : dict, optional
+            Point proposal head configuration (see :class:`PPN`) attached to
+            the embedder backbone. Disabled when omitted.
+        ppn_source : str, default 'iter0'
+            Pass whose backbone tensors feed the point proposal head:
+            ``iter0`` (unconditioned) or ``last`` (final iteration).
         """
         if do_iterate is not None:
             n_iterations = 2 if do_iterate else 1
@@ -274,6 +290,22 @@ class GraphSPICEIter(torch.nn.Module):
         for k in range(1, n_iterations):
             self._metric_keys += [f"{key}_iter{k}" for key in eval_keys + coh_mi]
 
+        self.filter_input = filter_input
+        if not filter_input and not self.embedder.predict_semantics:
+            raise ValueError("`filter_input: false` requires `predict_semantics`.")
+
+        # Point proposal head on the embedder backbone, built last so that the
+        # initialization of the other modules does not depend on it
+        if ppn_source not in ("iter0", "last"):
+            raise ValueError(
+                f"`ppn_source` must be 'iter0' or 'last', got {ppn_source}."
+            )
+        self.ppn_source = ppn_source
+        self.ppn = None
+        if ppn is not None:
+            backbone = split_attn_config(embedder["uresnet_attn"])[0]
+            self.ppn = PPN({**backbone, "num_classes": self.embedder.num_classes}, ppn)
+
     def _get_features(self, result: dict[str, Any]) -> TensorBatch:
         """Return the features used by the kernel."""
         if self.use_raw_features:
@@ -281,14 +313,15 @@ class GraphSPICEIter(torch.nn.Module):
         return result["hypergraph_features"]
 
     def _get_graph_seg_label(
-        self, seg_label: TensorBatch, segmentation: TensorBatch | None
+        self, seg_label: TensorBatch | None, segmentation: TensorBatch | None
     ) -> TensorBatch:
         """Return the semantics used to gate the per-shape graphs.
 
         The true labels during warmup; afterwards (if ``use_pred_sem_filter``)
-        the argmax of the raw per-voxel segmentation logits of this pass.
+        or without labels, the argmax of the raw per-voxel segmentation
+        logits of this pass.
         """
-        use_pred = (
+        use_pred = seg_label is None or (
             self.use_pred_sem_filter
             and segmentation is not None
             and self._forward_count >= self.pred_sem_filter_warmup_steps
@@ -296,11 +329,12 @@ class GraphSPICEIter(torch.nn.Module):
         if not use_pred:
             return seg_label
 
-        labels = seg_label.values.torch_tensor()
         with torch.no_grad():
-            pred_shape = torch.argmax(segmentation.tensor, dim=1).to(labels.dtype)
+            pred_shape = torch.argmax(segmentation.tensor, dim=1)
+        if seg_label is not None:
+            pred_shape = pred_shape.to(seg_label.values.torch_tensor().dtype)
 
-        return TensorBatch(pred_shape, seg_label.counts)
+        return TensorBatch(pred_shape, segmentation.counts)
 
     @torch.no_grad()
     def _compute_cohesion(
@@ -411,8 +445,9 @@ class GraphSPICEIter(torch.nn.Module):
             "cohesion_within": within,
             "cohesion_between": between,
             "cohesion_ratio": ratio,
-            **self._compute_mi_metrics(result["features"], seg_label),
         }
+        if seg_label is not None:
+            metrics.update(self._compute_mi_metrics(result["features"], seg_label))
         return {f"{k}{suffix}": v for k, v in metrics.items()}
 
     def _pool_semantics(self, segmentation: TensorBatch, node_pred: TensorBatch):
@@ -441,10 +476,16 @@ class GraphSPICEIter(torch.nn.Module):
         soft = torch.nn.functional.softmax(logits, dim=1)
         return TensorBatch(soft - soft.detach() + hard, segmentation.counts)
 
+    def _run_ppn(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Run the point proposal head on the backbone tensors of a pass."""
+        final_tensor = result.pop("final_tensor")
+        decoder_tensors = result.pop("decoder_tensors")
+        return self.ppn(final_tensor, decoder_tensors)
+
     def forward(
         self,
         data: TensorBatch,
-        seg_label: TensorBatch,
+        seg_label: TensorBatch | None = None,
         clust_label: ClusterLabelBatch | None = None,
     ) -> dict[str, Any]:
         """Run a batch of data through the iterative model.
@@ -453,8 +494,10 @@ class GraphSPICEIter(torch.nn.Module):
         ----------
         data : TensorBatch
             (N, 1 + D + N_f) tensor of voxel/value pairs
-        seg_label : TensorBatch
-            (N, 1 + D + 1) Tensor of segmentation labels
+        seg_label : TensorBatch, optional
+            (N, 1 + D + 1) Tensor of segmentation labels. Required with
+            ``filter_input``; otherwise graphs are gated by predictions
+            when it is omitted.
         clust_label : ClusterLabelBatch, optional
             Cluster labels, needed for edge labels and clustering metrics
 
@@ -472,9 +515,13 @@ class GraphSPICEIter(torch.nn.Module):
         )
         self._forward_count += 1
 
-        data, seg_label, clust_label, index = self.filter_class(
-            data, seg_label, clust_label
-        )
+        if self.filter_input:
+            data, seg_label, clust_label, index = self.filter_class(
+                data, seg_label, clust_label
+            )
+        else:
+            rows = torch.arange(len(data.tensor), device=data.tensor.device)
+            index = IndexBatch(rows, data.counts, data.counts)
 
         # Augmentation can empty every entry: nothing to embed or cluster
         if data.tensor.shape[0] == 0:
@@ -484,8 +531,14 @@ class GraphSPICEIter(torch.nn.Module):
         if clust_label is not None:
             cluster_labels = clust_label.voxel_field(self.constructor.target_col)
 
-        # Iteration 0: unconditional pass
-        result = self.embedder(data, cluster_id_full=None)
+        # Iteration 0: unconditional pass. With `ppn_source: last`, every pass
+        # keeps its backbone tensors so an early stop still feeds the PPN.
+        keep_tensors = self.ppn is not None
+        result = self.embedder(data, cluster_id_full=None, keep_tensors=keep_tensors)
+        ppn_result: dict[str, Any] = {}
+        if keep_tensors and self.ppn_source == "iter0":
+            ppn_result = self._run_ppn(result)
+            keep_tensors = False
         segmentation_iter0 = result.get("segmentation_iter0")
         if (
             segmentation_iter0 is not None
@@ -525,6 +578,9 @@ class GraphSPICEIter(torch.nn.Module):
                 node_pred = graph.get("node_pred")
                 if node_pred is None:
                     # Degenerate event: no clusters found, stop early
+                    if keep_tensors:
+                        ppn_result = self._run_ppn(result)
+                    result.update(ppn_result)
                     result.update(graph)
                     result.update({"iter_used": k, "filter_index": index})
                     if segmentation_iter0 is not None:
@@ -549,7 +605,10 @@ class GraphSPICEIter(torch.nn.Module):
             result.clear()
             del result
             result = self.embedder(
-                data, cluster_id_full=cluster_ids, node_confidence=node_conf
+                data,
+                cluster_id_full=cluster_ids,
+                node_confidence=node_conf,
+                keep_tensors=keep_tensors,
             )
             if self.track_iter_metrics:
                 result.update({key: float("nan") for key in self._metric_keys})
@@ -579,6 +638,9 @@ class GraphSPICEIter(torch.nn.Module):
         if do_metrics and "node_label" in graph:
             result.update(self._final_metrics(result, graph, seg_label))
 
+        if keep_tensors:
+            ppn_result = self._run_ppn(result)
+        result.update(ppn_result)
         result.update(graph)
         result.update({"iter_used": self.n_iter, "filter_index": index})
         if pool:
@@ -644,6 +706,8 @@ class GraphSPICEIterLoss(torch.nn.Module):
         w_contrastive: float = 0.0,
         contrastive_loss: dict[str, Any] | None = None,
         edge_loss: dict[str, Any] | None = None,
+        ppn_loss: dict[str, Any] | None = None,
+        w_ppn: float = 1.0,
         **graph_loss: Any,
     ) -> None:
         """Process the loss configuration.
@@ -660,6 +724,11 @@ class GraphSPICEIterLoss(torch.nn.Module):
             ``contrastive_n`` (number of anchors)
         edge_loss : dict, optional
             Extra edge-loss parameters (e.g. ``hard_negative_mining``)
+        ppn_loss : dict, optional
+            Point proposal loss configuration (see :class:`PPNLoss`), needed
+            when the model has a ``ppn`` head (requires ``ppn_label`` input)
+        w_ppn : float, default 1.0
+            Weight of the point proposal loss
         **graph_loss : dict
             Edge loss configuration
         """
@@ -668,6 +737,8 @@ class GraphSPICEIterLoss(torch.nn.Module):
         self.w_seg_iter0 = w_seg_iter0
         self.w_seg_iter_last = w_seg_iter_last
         self.w_contrastive = w_contrastive
+        self.ppn_loss_cfg = ppn_loss
+        self.w_ppn = w_ppn
 
         self.contrastive_loss_fn = None
         self.contrastive_n = 256
@@ -690,6 +761,7 @@ class GraphSPICEIterLoss(torch.nn.Module):
         shapes: list[str] | tuple[str, ...] = DEFAULT_SHAPES,
         invert: bool = True,
         cluster_semantic_pool: bool = False,
+        embedder: dict[str, Any] | None = None,
         **_kwargs: Any,
     ) -> None:
         """Build the constructor used for clustering metrics, if needed.
@@ -699,6 +771,9 @@ class GraphSPICEIterLoss(torch.nn.Module):
         """
         self.target_col = constructor.get("target_col", "cluster")
         self.cluster_semantic_pool = cluster_semantic_pool
+        self.ppn_loss = None
+        if self.ppn_loss_cfg is not None:
+            self.ppn_loss = PPNLoss(embedder["uresnet_attn"], self.ppn_loss_cfg)
         self.constructor = None
         if self.evaluate_clustering_metrics:
             self.constructor = ClusterGraphConstructor(
@@ -712,6 +787,7 @@ class GraphSPICEIterLoss(torch.nn.Module):
         filter_index: IndexBatch,
         segmentation_iter_last: TensorBatch | None = None,
         segmentation_iter0: TensorBatch | None = None,
+        ppn_label: TensorBatch | None = None,
         **output: Any,
     ) -> dict[str, Any]:
         """Compute the combined loss.
@@ -726,6 +802,8 @@ class GraphSPICEIterLoss(torch.nn.Module):
             (M) Index to narrow down the original tensor
         segmentation_iter_last, segmentation_iter0 : TensorBatch, optional
             Segmentation logits of the last and first passes
+        ppn_label : TensorBatch, optional
+            Point labels, required with a point proposal loss
         **output : dict
             Other outputs of the model
 
@@ -736,6 +814,8 @@ class GraphSPICEIterLoss(torch.nn.Module):
         """
         seg_label, clust_label = self.filter_class(seg_label, clust_label, filter_index)
         seg_label_t = seg_label.values.torch_tensor().long()
+        if "node_label" not in output:
+            output["node_label"] = clust_label.voxel_field(self.target_col)
         if "edge_label" not in output:
             output["edge_label"] = self.get_edge_labels(
                 clust_label,
@@ -784,6 +864,19 @@ class GraphSPICEIterLoss(torch.nn.Module):
             )
             result["contrastive_loss"] = float(c_loss)
             total_loss += self.w_contrastive * c_loss
+
+        if self.ppn_loss is not None:
+            if ppn_label is None:
+                raise ValueError("The point proposal loss requires `ppn_label`.")
+            ppn_result = self.ppn_loss(ppn_label, clust_label=clust_label, **output)
+            total_loss += self.w_ppn * ppn_result["loss"]
+            result.update(
+                {
+                    f"ppn_{key}": value
+                    for key, value in ppn_result.items()
+                    if not key.startswith("_")
+                }
+            )
 
         result["loss"] = total_loss
 

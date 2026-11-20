@@ -145,6 +145,7 @@ class AttnGraphSPICEEmbedder(torch.nn.Module):
         *,
         cluster_id_full: torch.Tensor | None = None,
         node_confidence: torch.Tensor | None = None,
+        keep_tensors: bool = False,
     ) -> dict[str, Any]:
         """Compute the embeddings for one batch of data.
 
@@ -157,6 +158,9 @@ class AttnGraphSPICEEmbedder(torch.nn.Module):
             the decoder attention. Without it, a plain decoder pass is run.
         node_confidence : torch.Tensor, optional
             (N,) per-voxel clustering confidence in [0, 1].
+        keep_tensors : bool, default False
+            Also return the sparse ``final_tensor`` and ``decoder_tensors``
+            (e.g. to feed a point proposal head).
 
         Returns
         -------
@@ -197,6 +201,9 @@ class AttnGraphSPICEEmbedder(torch.nn.Module):
             "coordinates": coordinate_batch,
             "features": TensorBatch(output_features, data.counts),
         }
+        if keep_tensors:
+            result["final_tensor"] = enc_out["final_tensor"]
+            result["decoder_tensors"] = decoder_tensors
 
         if not attend:
             if not self.use_raw_features:
