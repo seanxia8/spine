@@ -13,6 +13,11 @@ from spine.utils.torch import runtime
 from .csv import CSVLogger
 from .logger import logger
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
 __all__ = ["LogManager"]
 
 
@@ -37,6 +42,9 @@ class LogManager:
         tensorboard: bool | Mapping[str, Any] | None = None,
         tensorboard_dir: str | None = None,
         log_gpu_memory: bool = False,
+        wandb: bool | Mapping[str, Any] | None = None,
+        wandb_dir: str | None = None,
+        cfg: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize scalar logging backends.
 
@@ -58,13 +66,26 @@ class LogManager:
         log_gpu_memory : bool, default False
             Whether to collect CUDA memory metrics. Enable only for a run
             whose selected compute device is a GPU.
+        wandb : bool | Mapping[str, Any] | None, optional
+            Weights & Biases configuration. ``False`` or ``None`` disable it,
+            ``True`` uses defaults, and a mapping is forwarded to
+            ``wandb.init`` (``run_dir`` sets the local run directory).
+        wandb_dir : str | None, optional
+            Default local W&B run directory.
+        cfg : Mapping[str, Any] | None, optional
+            Full SPINE configuration recorded as the W&B run config.
         """
+        if tensorboard and wandb:
+            raise ValueError(
+                "Only one of `tensorboard` or `wandb` metric logging may be enabled."
+            )
         self.csv_logger = CSVLogger(
             file_name, overwrite=overwrite, buffer_size=buffer_size
         )
         self.tb_logger = self.initialize_tensorboard_logger(
             tensorboard, tensorboard_dir
         )
+        self.wandb_run = self.initialize_wandb_logger(wandb, wandb_dir, cfg)
         self.log_gpu_memory = log_gpu_memory
 
     @staticmethod
@@ -108,6 +129,42 @@ class LogManager:
         if writer_dir is not None and os.path.isdir(writer_dir):
             set_shared_tree_permissions(writer_dir)
         return writer
+
+    @staticmethod
+    def initialize_wandb_logger(
+        wandb: bool | Mapping[str, Any] | None,
+        wandb_dir: str | None = None,
+        cfg: Mapping[str, Any] | None = None,
+    ) -> Any | None:
+        """Initialize an optional Weights & Biases run.
+
+        Returns
+        -------
+        Any | None
+            Active ``wandb`` run when enabled and installed, otherwise ``None``.
+        """
+        if not wandb:
+            return None
+        if _wandb is None:
+            logger.warning(
+                "W&B logging requested but `wandb` is not installed; "
+                "run `pip install wandb` to enable it."
+            )
+            return None
+
+        wb_cfg = {} if wandb is True else dict(wandb)
+        run_dir = wb_cfg.pop("run_dir", wandb_dir)
+        if run_dir is not None:
+            os.makedirs(run_dir, exist_ok=True)
+
+        run = _wandb.init(
+            config=dict(cfg) if cfg is not None else None,
+            dir=run_dir,
+            settings=_wandb.Settings(start_method="fork"),
+            **wb_cfg,
+        )
+        logger.info("Weights & Biases run initialized: %s", run.url)
+        return run
 
     def append(
         self,
@@ -231,7 +288,8 @@ class LogManager:
         return metrics
 
     def append_tensorboard(self, log_row: Mapping[str, Any], iteration: int) -> None:
-        """Write collected scalar metrics to TensorBoard, if enabled."""
+        """Write collected scalar metrics to TensorBoard or W&B, if enabled."""
+        self.append_wandb(log_row, iteration)
         if self.tb_logger is None:
             return
 
@@ -242,6 +300,21 @@ class LogManager:
                 self.tb_logger.add_scalar(key, int(value), iteration)
             elif isinstance(value, (int, float, np.integer, np.floating)):
                 self.tb_logger.add_scalar(key, float(value), iteration)
+
+    def append_wandb(self, log_row: Mapping[str, Any], iteration: int) -> None:
+        """Write numeric, non-NaN scalar metrics to W&B, if enabled."""
+        if getattr(self, "wandb_run", None) is None:
+            return
+
+        self.wandb_run.log(
+            {
+                key: value
+                for key, value in log_row.items()
+                if isinstance(value, (bool, int, float, np.integer, np.floating))
+                and not (isinstance(value, float) and np.isnan(value))
+            },
+            step=iteration,
+        )
 
     @staticmethod
     def stdout_table_width(distributed: bool = False) -> int:
@@ -565,6 +638,8 @@ class LogManager:
             writer_dir = getattr(self.tb_logger, "log_dir", None)
             if writer_dir is not None and os.path.isdir(writer_dir):
                 set_shared_tree_permissions(writer_dir)
+        if getattr(self, "wandb_run", None) is not None:
+            self.wandb_run.finish()
 
 
 def get_first_entry(index: Any) -> Any:

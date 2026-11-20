@@ -7,6 +7,8 @@ import warnings
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import numpy as np
+
 from spine.config.factory import parse_module_config, resolve_module_provider
 from spine.geo import GeoManager
 from spine.utils.conditional import TORCH_AVAILABLE
@@ -645,7 +647,7 @@ class IOManager:
             self.watch.start("load")
             data = next(self.loader_iter)
             self.watch.stop("load")
-            return data
+            return self.add_label_counts(data)
 
         if self.dataset is not None:
             if entry is None and (run is None or subrun is None or event is None):
@@ -664,7 +666,7 @@ class IOManager:
             self.watch.start("load")
             data = self.dataset[dataset_index]
             self.watch.stop("load")
-            return data
+            return self.add_label_counts(data)
 
         if entry is None and (run is None or subrun is None or event is None):
             raise ValueError(
@@ -692,6 +694,29 @@ class IOManager:
         else:
             data = self.reader.get_run_event(run, subrun, event)
         self.watch.stop("read")
+        return self.add_label_counts(data)
+
+    @staticmethod
+    def add_label_counts(data: dict[str, Any]) -> dict[str, Any]:
+        """Add batch voxel and per-class voxel counts derived from ``seg_label``.
+
+        Adds ``batch_n_voxels`` and ``batch_n_cls{c}`` (at least classes 0-4)
+        so that label composition is logged with every iteration.
+        """
+        seg_label = data.get("seg_label")
+        if not hasattr(seg_label, "tensor"):
+            return data
+
+        tensor = seg_label.tensor
+        data["batch_n_voxels"] = tensor.shape[0]
+        labels = tensor[:, -1]
+        if hasattr(labels, "numpy"):
+            labels = labels.cpu().numpy()
+        labels = np.asarray(labels, dtype=np.int32)
+        if labels.size > 0:
+            for cls in range(max(int(labels.max()) + 1, 5)):
+                data[f"batch_n_cls{cls}"] = int((labels == cls).sum())
+
         return data
 
     def reset_loader(self) -> None:

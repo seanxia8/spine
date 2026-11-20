@@ -24,6 +24,7 @@ __all__ = [
     "cuda_memory_reserved",
     "cuda_max_memory_reserved",
     "cuda_memory_stats",
+    "cuda_reset_peak_memory_stats",
     "is_tensor",
     "distributed_barrier",
     "distributed_any",
@@ -221,6 +222,12 @@ def cuda_memory_stats():
     if TORCH_AVAILABLE and torch.cuda.is_available():
         return torch.cuda.memory_stats()
     return {}
+
+
+def cuda_reset_peak_memory_stats():
+    """Reset the CUDA peak memory counter for the current device."""
+    if TORCH_AVAILABLE and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
 
 
 def is_tensor(obj: Any) -> TypeGuard[_TensorLike]:

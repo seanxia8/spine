@@ -56,6 +56,7 @@ class ModelManager:
         find_unused_parameters: bool = False,
         iter_per_epoch: int | None = None,
         provider: str | None = None,
+        seed: int | None = None,
     ) -> None:
         """Process the model configuration.
 
@@ -94,6 +95,10 @@ class ModelManager:
             Attempts to detect unused model parameters in the forward pass
         iter_per_epoch : int, optional
             Number of iterations per epoch (relevant for training)
+        seed : int, optional
+            If provided, re-seed torch immediately before building the network
+            so backbone initialization does not depend on which auxiliary
+            modules other configurations construct first.
         """
         selectors = {}
         if name is not None:
@@ -151,6 +156,8 @@ class ModelManager:
         self.configured_weight_path = weight_path
         self.start_epoch: float | None = 0.0
         self.gradient_tracker: GradientTracker | None = None
+        self.log_grad_conflict = False
+        self.grad_log_step = 50
 
         # Determine device: use current_device() which setup_ddp() already configured
         if self.rank is None:
@@ -181,6 +188,10 @@ class ModelManager:
 
         # Initialize the model network and loss functions
         net_cls, loss_cls = model_factory(name)
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
         try:
             self.net = net_cls(**network_modules)
             self.net.to(device=self.device, dtype=self.dtype)
@@ -244,11 +255,14 @@ class ModelManager:
 
         # If the execution is distributed, wrap with DDP
         if self.distributed:
+            # No per-forward buffer broadcast: it is a collective that hangs
+            # every rank whenever one rank stalls in data loading.
             self.net = torch.nn.parallel.DistributedDataParallel(
                 self.net,
                 device_ids=[self.device_id],
                 output_device=self.device_id,
                 find_unused_parameters=find_unused_parameters,
+                broadcast_buffers=False,
             )
             if self.loss_fn is not None and any(
                 parameter.requires_grad for parameter in self.loss_fn.parameters()
@@ -278,6 +292,9 @@ class ModelManager:
         iter_per_epoch: int | None = None,
         scheduler_resume: str = "restore",
         gradient_tracking: bool | Mapping[str, Any] | None = None,
+        accum_steps: int = 1,
+        log_grad_conflict: bool = False,
+        grad_log_step: int = 50,
     ) -> None:
         """Initialize the training regimen.
 
@@ -318,6 +335,16 @@ class ModelManager:
             positive ``interval``, an ``include_global`` flag and named
             ``groups`` of parameter-name glob patterns. Canonical parameter
             names begin with ``network.`` or ``loss.``.
+        accum_steps : int, default 1
+            Number of minibatches whose gradients are accumulated before each
+            optimizer step. Gradients are averaged over the minibatches that
+            actually ran backward (skipped empty batches are excluded).
+        log_grad_conflict : bool, default False
+            If True, log the cosine similarity, conflict fraction and
+            magnitude ratio between segmentation and clustering loss gradients
+            on the shared decoder every ``grad_log_step`` iterations.
+        grad_log_step : int, default 50
+            Gradient-conflict logging period in iterations.
         """
         # Turn train on
         self.train = True
@@ -325,6 +352,12 @@ class ModelManager:
 
         # Store parameters
         self.weight_prefix = weight_prefix
+        if accum_steps < 1:
+            raise ValueError(f"`accum_steps` must be positive, got {accum_steps}.")
+        self.accum_steps = accum_steps
+        self._accum_nonzero = 0
+        self.log_grad_conflict = log_grad_conflict
+        self.grad_log_step = grad_log_step
         if resume is not None and not isinstance(resume, bool):
             raise TypeError("Training `resume` must be a boolean.")
         if not isinstance(scheduler_resume, str):
@@ -495,7 +528,6 @@ class ModelManager:
                 raise ValueError(
                     "Must provide iteration information when training a model."
                 )
-            self.optimizer.zero_grad(set_to_none=True)
 
         # Run the model forward
         self.watch.start("forward")
@@ -504,11 +536,18 @@ class ModelManager:
 
         # If training, run the backward pass and update the weights
         if self.train:
-            if "loss" not in result:
-                raise RuntimeError("Every trainable model must return a `loss` value.")
             self.watch.start("backward")
-            gradient_metrics = self.backward(result["loss"], iteration)
-            result.update(gradient_metrics)
+            if result.get("skip_backward", False):
+                # Empty batch: nothing to backpropagate, but still close the
+                # accumulation window so earlier gradients are not carried over
+                if self._is_step_iteration(iteration):
+                    result.update(self._flush_accum(iteration))
+            else:
+                if "loss" not in result:
+                    raise RuntimeError(
+                        "Every trainable model must return a `loss` value."
+                    )
+                result.update(self.backward(result["loss"], iteration))
             self.watch.stop("backward")
 
         # The driver owns checkpoint boundaries so it can validate these
@@ -1241,7 +1280,7 @@ class ModelManager:
             result = self.net(**input_dict)
 
             # Compute the loss if one is specified, append results
-            if self.loss_dict:
+            if self.loss_dict and not result.get("skip_backward", False):
                 # Configured loss inputs guarantee construction of a loss module.
                 assert self.loss_fn is not None
                 if not self.time_dependent:
@@ -1251,7 +1290,108 @@ class ModelManager:
                         self.loss_fn(iteration=iteration, **loss_dict, **result)
                     )
 
+            if self.train and getattr(self, "log_grad_conflict", False):
+                result.update(self._log_gradient_conflict(result, iteration))
+
         return result
+
+    def _log_gradient_conflict(
+        self, result: Mapping[str, Any], iteration: int | None
+    ) -> dict[str, float]:
+        """Compare segmentation and clustering loss gradients on the decoder.
+
+        Always returns all three keys (NaN off-cadence) so the CSV schema is
+        stable across iterations.
+        """
+        stats = {
+            "grad_cos_sim": float("nan"),
+            "grad_conflict_frac": float("nan"),
+            "grad_mag_ratio": float("nan"),
+        }
+        if iteration is None or iteration % self.grad_log_step != 0:
+            return stats
+
+        seg_loss = result.get("seg_loss_iter_last")
+        if seg_loss is None:
+            seg_loss = result.get("seg_loss_iter0")
+        cluster_loss = result.get("edge_loss")
+        if seg_loss is None or cluster_loss is None:
+            return stats
+
+        net = self.net.module if hasattr(self.net, "module") else self.net
+        try:
+            shared = [p for p in net.embedder.decoder.parameters() if p.requires_grad]
+        except AttributeError:
+            return stats
+        if not shared:
+            return stats
+
+        g_s = torch.autograd.grad(
+            seg_loss, shared, retain_graph=True, allow_unused=True
+        )
+        g_c = torch.autograd.grad(
+            cluster_loss, shared, retain_graph=True, allow_unused=True
+        )
+        pairs = [(a, b) for a, b in zip(g_s, g_c) if a is not None and b is not None]
+        if not pairs:
+            return stats
+
+        gs = torch.cat([a.flatten() for a, _ in pairs])
+        gc = torch.cat([b.flatten() for _, b in pairs])
+        dot = (gs * gc).sum()
+        return {
+            "grad_cos_sim": (dot / (gs.norm() * gc.norm()).clamp(min=1e-8)).item(),
+            "grad_conflict_frac": ((gs * gc) < 0).float().mean().item(),
+            "grad_mag_ratio": (gs.norm() / gc.norm().clamp(min=1e-8)).item(),
+        }
+
+    def _is_step_iteration(self, iteration: int | None) -> bool:
+        """Whether this iteration closes a gradient-accumulation window."""
+        accum_steps = getattr(self, "accum_steps", 1)
+        return iteration is None or (iteration + 1) % accum_steps == 0
+
+    def _flush_accum(self, iteration: int | None) -> dict[str, float | int]:
+        """Average accumulated gradients, then step optimizer and scheduler.
+
+        Returns
+        -------
+        dict
+            Gradient diagnostics collected before the optimizer update.
+        """
+        accum_nonzero = getattr(self, "_accum_nonzero", 1)
+        if accum_nonzero == 0:
+            return {}
+        tracker = getattr(self, "gradient_tracker", None)
+        if tracker is not None and iteration is None:
+            raise ValueError("Gradient tracking requires the current training iteration.")
+
+        # Average over minibatches which actually ran backward
+        scale = 1.0 / accum_nonzero
+        for group in self.optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    parameter.grad.mul_(scale)
+
+        # Read synchronized gradients before the optimizer can modify them.
+        gradient_metrics: dict[str, float | int] = {}
+        if tracker is not None:
+            gradient_metrics = tracker.collect(iteration)
+
+        # Step the optimizer
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self._accum_nonzero = 0
+
+        # Per-update schedules advance immediately after the optimizer.
+        self.step_scheduler("step")
+
+        # If the model has a buffer that needs to be updated, do it after
+        # the trainable parameter update
+        if hasattr(self.net, "update_buffers"):
+            logger.info("Updating buffers")
+            self.net.update_buffers()
+
+        return gradient_metrics
 
     def backward(
         self, loss: Any, iteration: int | None = None
@@ -1279,32 +1419,14 @@ class ModelManager:
                 "Ensure it depends on at least one trainable model parameter."
             )
 
-        # Run the model backward
+        # Accumulate unnormalized gradients; _flush_accum averages them at the
+        # step boundary so skipped minibatches are excluded from the count.
         loss.backward()
+        self._accum_nonzero = getattr(self, "_accum_nonzero", 0) + 1
+        if not self._is_step_iteration(iteration):
+            return {}
 
-        # Read synchronized gradients before the optimizer can modify them.
-        gradient_metrics: dict[str, float | int] = {}
-        tracker = getattr(self, "gradient_tracker", None)
-        if tracker is not None:
-            if iteration is None:
-                raise ValueError(
-                    "Gradient tracking requires the current training iteration."
-                )
-            gradient_metrics = tracker.collect(iteration)
-
-        # Step the optimizer
-        self.optimizer.step()
-
-        # Per-update schedules advance immediately after the optimizer.
-        self.step_scheduler("step")
-
-        # If the model has a buffer that needs to be updated, do it after
-        # the trainable parameter update
-        if hasattr(self.net, "update_buffers"):
-            logger.info("Updating buffers")
-            self.net.update_buffers()
-
-        return gradient_metrics
+        return self._flush_accum(iteration)
 
     def cast_to_numpy(self, result: dict[str, Any]) -> None:
         """Casts the model output data products to numpy object in place.

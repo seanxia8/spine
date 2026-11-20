@@ -401,6 +401,7 @@ class Driver:
         split_output: bool = False,
         tensorboard: bool | Mapping[str, Any] | None = None,
         graceful_stop_file: str | None = None,
+        metrics: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize the driver state derived from the ``base`` block.
 
@@ -453,6 +454,11 @@ class Driver:
             Marker file polled by the main rank at safe minibatch boundaries.
             Its presence requests validation, checkpointing and successful
             completion of a training run.
+        metrics : Mapping[str, Any] | None, optional
+            Metric-logging backend configuration with at most one of
+            ``tensorboard`` or ``wandb``. The ``wandb`` mapping is forwarded
+            to ``wandb.init`` (e.g. ``project``, ``name``, ``tags``,
+            ``run_dir``). ``metrics.tensorboard`` overrides ``tensorboard``.
         """
         # Set up the seed
         random.seed(seed)
@@ -505,7 +511,8 @@ class Driver:
         self.seed = seed
         self.log_step = log_step
         self.split_output = split_output
-        self.tensorboard_cfg = tensorboard
+        self.metrics_cfg = dict(metrics) if metrics else {}
+        self.tensorboard_cfg = self.metrics_cfg.pop("tensorboard", tensorboard)
 
     def initialize_io(self, io: Mapping[str, Any]) -> None:
         """Initialize the input/output manager.
@@ -599,6 +606,7 @@ class Driver:
             rank=self.rank,
             distributed=getattr(self, "ddp", getattr(self, "distributed", False)),
             iter_per_epoch=self.io.iter_per_epoch,
+            seed=getattr(self, "seed", None),
         )
 
     def restore_training_runtime(self) -> None:
@@ -878,7 +886,15 @@ class Driver:
         if self.prefix_log:
             log_name = self.io.format_log_name(log_name, self.log_dir)
 
-        # Initialize the log
+        # Initialize the log (W&B only on the main process)
+        wandb_kwargs = {}
+        wandb_cfg = getattr(self, "metrics_cfg", {}).get("wandb")
+        if wandb_cfg and getattr(self, "main_process", True):
+            wandb_kwargs = dict(
+                wandb=wandb_cfg,
+                wandb_dir=os.path.join(self.log_dir, "wandb"),
+                cfg=getattr(self, "cfg", None),
+            )
         log_path = os.path.join(self.log_dir, log_name)
         tb_dir = os.path.join(self.log_dir, "tensorboard")
         self.log_manager = LogManager(
@@ -890,6 +906,7 @@ class Driver:
             ),
             tensorboard_dir=tb_dir,
             log_gpu_memory=getattr(self, "world_size", 0) > 0,
+            **wandb_kwargs,
         )
 
     def __len__(self) -> int:
@@ -1528,6 +1545,9 @@ class Driver:
             if watch.running or watch.paused:
                 self.watch.reset()
                 break
+
+        # Report per-iteration peak GPU memory, not the lifetime maximum
+        runtime.cuda_reset_peak_memory_stats()
 
         self.watch.start("iteration")
 

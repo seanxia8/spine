@@ -34,6 +34,7 @@ else:
 __all__ = [
     "SequentialBatchSampler",
     "RandomSequenceBatchSampler",
+    "RandomBatchSampler",
     "BootstrapBatchSampler",
     "JointSequentialBatchSampler",
     "JointRandomSequenceBatchSampler",
@@ -264,6 +265,19 @@ class RandomSequenceBatchSampler(AbstractBatchSampler):
         indices = indices % self.num_samples
 
         return self._record(indices)
+
+class RandomBatchSampler(AbstractBatchSampler):
+    """Samples entries in a uniformly random order within the dataset."""
+
+    name = "random"
+
+    def __iter__(self) -> Iterator[int]:
+        """Iterates over a random permutation of the dataset entries."""
+        resumed = self._resume()
+        if resumed is not None:
+            return resumed
+
+        return self._record(self._random.permutation(self.num_samples))
 
 
 class BootstrapBatchSampler(AbstractBatchSampler):
