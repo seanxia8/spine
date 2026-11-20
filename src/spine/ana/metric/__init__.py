@@ -7,6 +7,7 @@ This submodule is used to evaluate reconstruction quality metrics, such as:
 - ...
 """
 
+from .attn_superposition import *
 from .cluster import *
 from .optical import *
 from .point import *
