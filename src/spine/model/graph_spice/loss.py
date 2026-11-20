@@ -11,7 +11,7 @@ from spine.data import ClusterLabelBatch, TensorBatch
 from spine.model.common.factories import loss_fn_factory, metric_fn_factory
 from spine.model.common.weighting import get_class_weights
 
-__all__ = ["EdgeLoss"]
+__all__ = ["EdgeLoss", "ContrastiveLoss"]
 
 
 class BinaryMetric(torch.nn.Module):
@@ -33,6 +33,8 @@ class EdgeLoss(torch.nn.Module):
         equal_sampling: bool = False,
         min_sample_edges: int = 1000,
         metric: Config | None = "iou",
+        hard_negative_mining: bool = False,
+        hard_negative_keep_easy: float = 0.2,
     ) -> None:
         """Initialize the edge-classification loss.
 
@@ -51,6 +53,12 @@ class EdgeLoss(torch.nn.Module):
             sampling is enabled. Sampling uses replacement when necessary.
         metric : str or mapping, optional
             Additional binary metric configuration.
+        hard_negative_mining : bool, default False
+            Restrict the loss to currently mis-predicted edges plus a random
+            fraction of correctly predicted ones. Accuracy and the metric are
+            still reported on all edges.
+        hard_negative_keep_easy : float, default 0.2
+            Fraction of correctly predicted edges kept by hard negative mining.
         """
         # Initialize the parent class
         super().__init__()
@@ -63,6 +71,8 @@ class EdgeLoss(torch.nn.Module):
         self.balance_loss = balance_loss
         self.equal_sampling = equal_sampling
         self.min_sample_edges = min_sample_edges
+        self.hard_negative_mining = hard_negative_mining
+        self.hard_negative_keep_easy = hard_negative_keep_easy
 
         # Initialize the edge objective and optional assignment metric
         self.loss_fn = loss_fn_factory(loss, reduction="none")
@@ -162,18 +172,32 @@ class EdgeLoss(torch.nn.Module):
             raise ValueError("Edge labels must be binary (0 or 1).")
         edge_labels = edge_labels.long()
 
-        # Apply optional equal-class sampling and target inversion
+        # Invert first so predictions, mining and metrics share a label space
+        if self.invert:
+            edge_labels = torch.logical_not(edge_labels).long()
+
+        # Metrics are reported on all edges, not the supervised subset
+        all_predictions = (edge_logits > 0.0).long()
+        all_labels = edge_labels
+
+        # Keep mis-predicted edges and a random fraction of correct ones
+        if self.hard_negative_mining:
+            wrong = all_predictions != edge_labels
+            easy = (
+                torch.rand(len(edge_logits), device=edge_logits.device)
+                < self.hard_negative_keep_easy
+            )
+            keep = wrong | easy
+            edge_logits, edge_labels = edge_logits[keep], edge_labels[keep]
+
+        # Apply optional equal-class sampling
         if self.equal_sampling:
             edge_logits, edge_labels = self.sample_edges(
                 edge_logits,
                 edge_labels,
             )
 
-        if self.invert:
-            edge_labels = torch.logical_not(edge_labels).long()
-
-        edge_predictions = (edge_logits > 0.0).long()
-        num_edges = len(edge_predictions)
+        num_edges = len(edge_logits)
 
         # Reduce the objective, preserving a differentiable zero for empty graphs
         if num_edges == 0:
@@ -191,14 +215,14 @@ class EdgeLoss(torch.nn.Module):
 
         # Compute binary assignment accuracy and the optional metric
         accuracy = 1.0
-        if num_edges > 0:
-            accuracy = float((edge_predictions == edge_labels).sum() / num_edges)
+        if len(all_labels) > 0:
+            accuracy = float((all_predictions == all_labels).sum() / len(all_labels))
 
         metric = {}
         if self.metric_fn is not None:
             metric[self.metric_fn.name] = self.metric_fn(
-                edge_labels,
-                edge_predictions,
+                all_labels,
+                all_predictions,
             )
 
         return {
@@ -207,3 +231,58 @@ class EdgeLoss(torch.nn.Module):
             "count": num_edges,
             **metric,
         }
+
+
+class ContrastiveLoss(torch.nn.Module):
+    """Triplet-style contrastive loss on node embeddings.
+
+    For up to ``n`` random anchors, the ``k_pairs`` nearest same-cluster and
+    nearest other-cluster embeddings are averaged (soft centroids), then
+    ``mean(max(0, margin + |a - p| - |a - n|))`` is computed on L2-normalized
+    vectors.
+    """
+
+    name = "contrastive"
+
+    def __init__(self, margin: float = 1.0, k_pairs: int = 1) -> None:
+        super().__init__()
+        self.margin = margin
+        self.k_pairs = k_pairs
+
+    @torch.no_grad()
+    def sample_features(
+        self, features: torch.Tensor, labels: torch.Tensor, n: int = 256
+    ) -> tuple[list[int], list[torch.Tensor], list[torch.Tensor]]:
+        """Select anchors with their nearest positive and negative neighbors."""
+        n = min(n, len(labels))
+        anchors, positives, negatives = [], [], []
+        for i in torch.randperm(len(labels), device=labels.device)[:n].tolist():
+            pos_pool = (labels == labels[i]).nonzero(as_tuple=False).squeeze(1)
+            pos_pool = pos_pool[pos_pool != i]
+            neg_pool = (labels != labels[i]).nonzero(as_tuple=False).squeeze(1)
+            if pos_pool.numel() < 1 or neg_pool.numel() < 1:
+                continue
+            pos_dists = (features[pos_pool] - features[i]).norm(dim=1)
+            neg_dists = (features[neg_pool] - features[i]).norm(dim=1)
+            k_pos = min(self.k_pairs, pos_pool.numel())
+            k_neg = min(self.k_pairs, neg_pool.numel())
+            anchors.append(i)
+            positives.append(pos_pool[pos_dists.topk(k_pos, largest=False).indices])
+            negatives.append(neg_pool[neg_dists.topk(k_neg, largest=False).indices])
+
+        return anchors, positives, negatives
+
+    def forward(
+        self, features: torch.Tensor, labels: torch.Tensor, n: int = 256
+    ) -> torch.Tensor:
+        anchors, positives, negatives = self.sample_features(features, labels, n)
+        if not anchors:
+            return torch.tensor(0.0, device=features.device, requires_grad=True)
+
+        normalize = torch.nn.functional.normalize
+        a = normalize(features[anchors], dim=1)
+        p = normalize(torch.stack([features[k].mean(0) for k in positives]), dim=1)
+        n_f = normalize(torch.stack([features[k].mean(0) for k in negatives]), dim=1)
+        return torch.clamp(
+            self.margin + (a - p).norm(dim=1) - (a - n_f).norm(dim=1), min=0
+        ).mean()

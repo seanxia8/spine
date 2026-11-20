@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 
 from spine.model import sparse
 
 
-class LayerNorm(nn.Module):
+class LayerNorm(torch.nn.Module):
     """Apply ``torch.nn.LayerNorm`` across the channels of each active site.
 
     Unlike batch normalization, there are no running statistics, so training
@@ -26,7 +25,7 @@ class LayerNorm(nn.Module):
 
     def __init__(self, num_features, eps=1e-5, elementwise_affine=True):
         super().__init__()
-        self.ln = nn.LayerNorm(
+        self.ln = torch.nn.LayerNorm(
             num_features, eps=eps, elementwise_affine=elementwise_affine
         )
 

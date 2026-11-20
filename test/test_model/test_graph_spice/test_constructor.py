@@ -73,7 +73,7 @@ def test_constructor_prediction_evaluation_and_entry_selection():
     graph["node_label"] = TensorBatch(torch.tensor([0, 0, 1]), counts=[3])
     metrics = constructor.evaluate(graph)
     assert len(metrics["ari"]) == 1
-    assert metrics["ari_1"] == [1.0]
+    assert np.isnan(metrics["ari_1"][0])  # absent shapes are excluded, not perfect
     averaged = constructor.evaluate(graph, mean=True)
     assert np.isscalar(averaged["purity"])
 

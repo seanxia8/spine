@@ -15,11 +15,95 @@ from spine.cluster.formation import form_clusters
 from spine.config.factory import extract_module_parameters, resolve_module_provider
 from spine.constants.factory import enum_factory
 from spine.data import IndexBatch, ObjectList, TensorBatch
-from spine.math.metrics import ari, eff, pur
+from spine.math.metrics import ari, eff, pur, sbd
 
 from .connected import ConnectedComponentClusterer
 
-__all__ = ["ClusterGraphConstructor"]
+__all__ = ["ClusterGraphConstructor", "radius_topk_graph"]
+
+
+def radius_topk_graph(x, k, r, batch=None, loop=False, max_search_neighbors=None):
+    """Connect each node to its ``k`` closest neighbors within radius ``r``.
+
+    Unlike the ``max_num_neighbors`` cap of ``radius_graph``, which keeps an
+    arbitrary subset once a node has more candidates, every candidate within
+    ``r`` is ranked by distance and the ``k`` closest are kept. Nodes with
+    fewer than ``k`` neighbors within ``r`` get fewer edges.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        (N, D) Point coordinates
+    k : int
+        Maximum number of neighbors to keep per node
+    r : float
+        Radius within which candidates are considered
+    batch : torch.Tensor, optional
+        (N) Batch index per point
+    loop : bool, default False
+        If `True`, include self-loops
+    max_search_neighbors : int, optional
+        Candidate cap of the underlying radius search, ``max(10 * k, 64)`` by
+        default. It must exceed the local density for the selection to be exact.
+
+    Returns
+    -------
+    torch.Tensor
+        (2, E) Edge index
+    """
+    search_cap = max_search_neighbors or max(10 * k, 64)
+    edge_index = radius_graph(
+        x, r, batch=batch, loop=loop, max_num_neighbors=search_cap
+    )
+    if edge_index.shape[1] == 0:
+        return edge_index
+
+    # Sort by distance, then stably by source to group edges per source node
+    src, dst = edge_index
+    dist = (x[src] - x[dst]).norm(dim=1)
+    order = torch.argsort(dist)
+    order = order[torch.argsort(src[order], stable=True)]
+
+    # Rank of each edge within its source group (0 = closest)
+    _, counts = torch.unique_consecutive(src[order], return_counts=True)
+    group_starts = torch.cumsum(counts, 0) - counts
+    rank = torch.arange(len(order), device=x.device) - torch.repeat_interleave(
+        group_starts, counts
+    )
+
+    return edge_index[:, order[rank < k]]
+
+
+def build_graph_fn(cfg, context="graph constructor"):
+    """Partially instantiate a graph construction function from its config.
+
+    Parameters
+    ----------
+    cfg : dict
+        Graph configuration with a ``provider`` (or ``name``) among
+        ``knn``, ``radius`` and ``radius_topk``, plus its parameters.
+    context : str, default 'graph constructor'
+        Name used in error messages.
+    """
+    name = resolve_module_provider(cfg)
+    if name is None:
+        raise ValueError(f"Must provide the {context} `provider`.")
+    params = extract_module_parameters(
+        {key: value for key, value in cfg.items() if key not in {"provider", "name"}},
+        context=context[0].upper() + context[1:],
+    )
+    graph_fns = {
+        "knn": knn_graph,
+        "radius": radius_graph,
+        "radius_topk": radius_topk_graph,
+    }
+    if name not in graph_fns:
+        raise ValueError(
+            f"Requested graph construction mode ('{name}') is not "
+            "recognized. Must be one of 'knn', 'radius' or 'radius_topk'"
+        )
+
+    return partial(graph_fns[name], **params)
 
 
 class ClusterGraphConstructor:
@@ -33,12 +117,14 @@ class ClusterGraphConstructor:
         shapes,
         edge_threshold,
         kernel_fn=None,
+        edge_proj=None,
         min_size=0,
         invert=True,
         label_edges=False,
         target_col: str = "cluster",
         training=False,
         orphan=None,
+        union_graph=None,
     ):
         """Initialize the cluster graph constructor.
 
@@ -53,6 +139,8 @@ class ClusterGraphConstructor:
             if the `inverted` parameter is turned on
         kernel_fn : callable, optional
             Kernel function computing edge scores from edge features
+        edge_proj : callable, optional
+            Projection applied to node features before the kernel
         min_size : int, default 0
             Minimum number of points below which pixels are considered orphans
             to be merged into touching larger clusters
@@ -66,6 +154,10 @@ class ClusterGraphConstructor:
             If `True`, this constructor is being used at train time
         orphan : dict, optional
             Orphan clustering configuration dictionary
+        union_graph : dict, optional
+            ``spatial`` and ``feature`` graph configurations. When the
+            constructor is called with ``use_union_graph=True``, the union of a
+            coordinate-space graph and a feature-space graph replaces ``graph``.
 
         Raises
         ------
@@ -81,35 +173,31 @@ class ClusterGraphConstructor:
         self.invert = invert
         self.label_edges = label_edges
         self.kernel_fn = kernel_fn
+        self.edge_proj = edge_proj
         self.target_col = target_col
 
         # Partially instantiate the graph constructor functions
-        name = resolve_module_provider(graph)
-        if name is None:
-            raise ValueError("Must provide the graph constructor `provider`.")
-        graph = extract_module_parameters(
-            {
-                key: value
-                for key, value in graph.items()
-                if key not in {"provider", "name"}
-            },
-            context="Graph constructor",
-        )
-        self.graph_fn: Callable[[torch.Tensor], torch.Tensor]
-        if name == "knn":
-            self.graph_fn = partial(knn_graph, **graph)
-        elif name == "radius":
-            self.graph_fn = partial(radius_graph, **graph)
-        else:
-            raise ValueError(
-                f"Requested graph construction mode ('{name}') is not "
-                "recognized. Must be one of 'knn' or 'radius'"
+        self.graph_fn: Callable[[torch.Tensor], torch.Tensor] = build_graph_fn(graph)
+        self.union_spatial_fn = None
+        self.union_feature_fn = None
+        if union_graph is not None:
+            if "spatial" not in union_graph or "feature" not in union_graph:
+                raise ValueError(
+                    "`union_graph` must contain both `spatial` and `feature`."
+                )
+            self.union_spatial_fn = build_graph_fn(
+                union_graph["spatial"], "union_graph.spatial"
+            )
+            self.union_feature_fn = build_graph_fn(
+                union_graph["feature"], "union_graph.feature"
             )
 
         # Initialize the cluster assignment class
         self.ccc = ConnectedComponentClusterer(min_size, orphan)
 
-    def __call__(self, coords, features, seg_label, clust_label=None):
+    def __call__(
+        self, coords, features, seg_label, clust_label=None, use_union_graph=False
+    ):
         """Constructs graphs for all the entries in a batch, one per shape.
 
         Parameters
@@ -123,6 +211,8 @@ class ClusterGraphConstructor:
             - 1 is the segmentation label
         clust_label : TensorBatch, optional
             (N) Target cluster index for each voxel.
+        use_union_graph : bool, default False
+            If `True`, build the spatial + feature union graph
         """
         # Loop over the unique batch indices, build a list of graphs for each
         graph = defaultdict(list)
@@ -133,7 +223,11 @@ class ClusterGraphConstructor:
             # Build graphs (one per semantic type)
             clust_label_b = clust_label[b] if clust_label is not None else None
             graphs_b, edge_count = self.build_graph(
-                coords[b], features[b], shape_labels[b], clust_label_b
+                coords[b],
+                features[b],
+                shape_labels[b],
+                clust_label_b,
+                use_union_graph=use_union_graph,
             )
 
             # Append the output
@@ -173,10 +267,14 @@ class ClusterGraphConstructor:
         graph["node_coords"] = coords
         graph["node_features"] = features
         graph["node_shapes"] = shape_labels
+        if clust_label is not None:
+            graph["node_label"] = clust_label
 
         return graph
 
-    def build_graph(self, coords, features, seg_label, clust_label=None):
+    def build_graph(
+        self, coords, features, seg_label, clust_label=None, use_union_graph=False
+    ):
         """Construct a graph for a single batch id and semantic class that
         will be used for connected components clustering.
 
@@ -193,6 +291,8 @@ class ClusterGraphConstructor:
             - 1 is the segmentation label
         clust_label : torch.Tensor, optional
             (N) Target cluster index for each voxel.
+        use_union_graph : bool, default False
+            If `True`, build the spatial + feature union graph
 
         Returns
         -------
@@ -228,16 +328,35 @@ class ClusterGraphConstructor:
                 continue
 
             # Make the graph edge index
-            edge_index = self.graph_fn(coords[seg_index])
+            coords_s = coords[seg_index]
+            features_s = features[seg_index]
+            if use_union_graph and self.union_spatial_fn is not None:
+                with torch.no_grad():
+                    feature_index = self.union_feature_fn(features_s)
+                edge_index = torch.unique(
+                    torch.cat([self.union_spatial_fn(coords_s), feature_index], dim=1),
+                    dim=1,
+                )
+            else:
+                edge_index = self.graph_fn(coords_s)
             graph["edge_clusts"].append(
                 edge_count + torch.arange(edge_index.shape[1], device=coords.device)
             )
             edge_count += edge_index.shape[1]
 
-            # Produce edge predictions
-            features_s = features[seg_index]
+            # Produce edge predictions, letting the kernel see edge lengths
+            # if it uses them
+            kernel_kwargs = {}
+            if getattr(self.kernel_fn, "use_spatial_dist", False):
+                kernel_kwargs["spatial_dist"] = (
+                    (coords_s[edge_index[0]] - coords_s[edge_index[1]])
+                    .norm(dim=1)
+                    .detach()
+                )
+            if self.edge_proj is not None:
+                features_s = self.edge_proj(features_s)
             edge_attr = self.kernel_fn(
-                features_s[edge_index[0]], features_s[edge_index[1]]
+                features_s[edge_index[0]], features_s[edge_index[1]], **kernel_kwargs
             )
 
             # Append
@@ -352,7 +471,7 @@ class ClusterGraphConstructor:
         """
         # No gradients through this evaluation
         result = defaultdict(list)
-        metrics = {"ari": ari, "purity": pur, "efficiency": eff}
+        metrics = {"ari": ari, "purity": pur, "efficiency": eff, "sbd": sbd}
         with torch.no_grad():
             # Clustering metrics are NumPy/Numba routines, so detach model outputs
             # once before evaluating the individual batch entries and shapes.
@@ -379,10 +498,10 @@ class ClusterGraphConstructor:
                     node_label_b_s = node_label_b[node_index]
                     node_pred_b_s = node_pred_b[node_index]
 
-                    # If there are no points of this type, append default values
+                    # Absent shapes are not failures: exclude them from the mean
                     if len(node_index) == 0:
                         for m in metrics:
-                            result[f"{m}_{shape}"].append(1.0)
+                            result[f"{m}_{shape}"].append(float("nan"))
                         continue
 
                     # Otherwise, compute the metrics
@@ -394,7 +513,7 @@ class ClusterGraphConstructor:
         # Compute batch averaged metrics, return
         if mean:
             for key, value in result.items():
-                result[key] = np.mean(value)
+                result[key] = np.nanmean(value)
 
         return result
 

@@ -1,8 +1,6 @@
 """Serialized (space-filling-curve windowed) attention for sparse tensors."""
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from spine.model import sparse
 
@@ -55,14 +53,16 @@ class SerializedAttention(sparse.Network):
         self.scale = scale if scale is not None else (embed_dim // num_heads) ** -0.5
         self.order = order
         self.qkv_bias = qkv_bias
-        self.qkv_proj = nn.Linear(in_channels, 3 * embed_dim, bias=qkv_bias)
-        self.out_proj = nn.Linear(embed_dim, in_channels, bias=False)
+        self.qkv_proj = torch.nn.Linear(in_channels, 3 * embed_dim, bias=qkv_bias)
+        self.out_proj = torch.nn.Linear(embed_dim, in_channels, bias=False)
 
-        self.gate = nn.Parameter(torch.tensor(attention_gain, requires_grad=True))
+        self.gate = torch.nn.Parameter(torch.tensor(attention_gain, requires_grad=True))
         self.enable_flash = enable_flash and (flash_attn is not None)
 
         if not self.enable_flash:
-            self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+            self.mha = torch.nn.MultiheadAttention(
+                embed_dim, num_heads, batch_first=True
+            )
 
     def cluster_hilbert_order(
         self,
@@ -113,8 +113,8 @@ class SerializedAttention(sparse.Network):
             )
             * self.window_size
         )
-        _offset = nn.functional.pad(bincount.cumsum(dim=0), (1, 0))
-        _offset_pad = nn.functional.pad(torch.cumsum(bincount_pad, dim=0), (1, 0))
+        _offset = torch.nn.functional.pad(bincount.cumsum(dim=0), (1, 0))
+        _offset_pad = torch.nn.functional.pad(torch.cumsum(bincount_pad, dim=0), (1, 0))
         pad = torch.arange(_offset_pad[-1], device=bincount_pad.device)
         unpad = torch.arange(_offset[-1], device=bincount_pad.device)
         cu_seqlens = []
@@ -144,7 +144,7 @@ class SerializedAttention(sparse.Network):
                     device=bincount.device,
                 )
             )
-        cu_seqlens = nn.functional.pad(
+        cu_seqlens = torch.nn.functional.pad(
             torch.cat(cu_seqlens), (0, 1), value=_offset_pad[-1]
         )
         return pad, unpad, cu_seqlens
@@ -196,7 +196,7 @@ class SerializedAttention(sparse.Network):
             n_cid_val = int(cid_sorted.max()) + 1
             compound = batch_sorted * n_cid_val + cid_sorted
             _, per_group_counts = torch.unique_consecutive(compound, return_counts=True)
-            cu_seqlens_varlen = F.pad(
+            cu_seqlens_varlen = torch.nn.functional.pad(
                 per_group_counts.to(torch.int32).cumsum(0), (1, 0), value=0
             )
             max_seqlen_varlen = int(per_group_counts.max())
@@ -241,7 +241,7 @@ class SerializedAttention(sparse.Network):
             q, k, v = qkv.view(n_win, K, 3, H, E // H).permute(2, 0, 3, 1, 4).unbind(0)
 
             try:
-                out = F.scaled_dot_product_attention(
+                out = torch.nn.functional.scaled_dot_product_attention(
                     q,
                     k,
                     v,

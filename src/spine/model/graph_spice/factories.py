@@ -13,7 +13,7 @@ from spine.config.factory import (
 )
 
 from .kernel import BilinearKernel, DefaultKernel, MLPKernel
-from .loss import EdgeLoss
+from .loss import ContrastiveLoss, EdgeLoss
 
 __all__ = ["backbone_factory", "kernel_factory", "loss_factory"]
 
@@ -105,5 +105,5 @@ def loss_factory(cfg: Config) -> torch.nn.Module:
     torch.nn.Module
         Instantiated clustering loss.
     """
-    losses = {EdgeLoss.name: EdgeLoss}
+    losses = {EdgeLoss.name: EdgeLoss, ContrastiveLoss.name: ContrastiveLoss}
     return instantiate(losses, cfg)

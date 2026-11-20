@@ -13,6 +13,7 @@ def test_model_discovery_is_dependency_light():
     assert model_names() == (
         "full_chain",
         "graph_spice",
+        "graph_spice_iter",
         "grappa",
         "image",
         "spice",

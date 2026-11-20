@@ -182,7 +182,15 @@ class BilinearKernel(torch.nn.Module):
 
     name = "bilinear"
 
-    def __init__(self, num_features: int, bias: bool = False) -> None:
+    def __init__(
+        self,
+        num_features: int,
+        bias: bool = False,
+        use_spatial_dist: bool = False,
+        bilinear_out: int = 1,
+        mlp_hidden: int | None = None,
+        spatial_dist_scale: float = 1.0,
+    ) -> None:
         """Initialize the kernel.
 
         Parameters
@@ -191,6 +199,18 @@ class BilinearKernel(torch.nn.Module):
             Number of dimensions in feature embedding space
         bias : bool, default False
             If `True`, allows for an overall bias in the bilinear layer
+        use_spatial_dist : bool, default False
+            If `True`, the spatial distance between the two nodes also enters
+            the edge logit (additively for one bilinear output, through the
+            MLP head otherwise). Requires ``spatial_dist`` at call time.
+        bilinear_out : int, default 1
+            Number of parallel bilinear forms. With more than one, a small MLP
+            head combines them (and the optional distance) into one logit.
+        mlp_hidden : int, optional
+            Hidden width of the MLP head, ``max(2 * bilinear_out, 32)`` by
+            default.
+        spatial_dist_scale : float, default 1.0
+            The kernel uses ``log1p(spatial_dist / spatial_dist_scale)``.
         """
         # Initialize the parent class
         super().__init__()
@@ -200,9 +220,32 @@ class BilinearKernel(torch.nn.Module):
 
         # Initialize the bilinear layer
         self.num_features = num_features
-        self.bilin = torch.nn.Bilinear(num_features, num_features, 1, bias=bias)
+        self.use_spatial_dist = use_spatial_dist
+        self.spatial_dist_scale = spatial_dist_scale
+        self.bilin = torch.nn.Bilinear(
+            num_features, num_features, bilinear_out, bias=bias
+        )
 
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        # One output: logit = bilinear + w * dist. Several: MLP head.
+        self.dist_weight = None
+        self.head = None
+        if bilinear_out == 1:
+            if use_spatial_dist:
+                self.dist_weight = torch.nn.Linear(1, 1, bias=False)
+        else:
+            hidden = mlp_hidden if mlp_hidden is not None else max(2 * bilinear_out, 32)
+            self.head = torch.nn.Sequential(
+                torch.nn.Linear(bilinear_out + int(use_spatial_dist), hidden),
+                torch.nn.ELU(),
+                torch.nn.Linear(hidden, 1),
+            )
+
+    def forward(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        spatial_dist: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Computes the kernel edge score of all node pairs in the graph.
 
         Parameters
@@ -211,6 +254,8 @@ class BilinearKernel(torch.nn.Module):
             (E, N_f) Features of the source nodes
         x2 : torch.Tensor
             (E, N_f) Features of the target nodes
+        spatial_dist : torch.Tensor, optional
+            (E,) Distance between the two nodes, used if ``use_spatial_dist``
 
         Returns
         -------
@@ -230,7 +275,16 @@ class BilinearKernel(torch.nn.Module):
                 f"{tuple(x2.shape)}."
             )
 
-        return self.bilin(x1, x2)
+        out = self.bilin(x1, x2)
+        if self.use_spatial_dist and spatial_dist is not None:
+            dist = torch.log1p(spatial_dist / self.spatial_dist_scale).unsqueeze(1)
+            if self.dist_weight is not None:
+                return out + self.dist_weight(dist)
+            return self.head(torch.cat([out, dist], dim=1))
+        if self.head is not None:
+            return self.head(out)
+
+        return out
 
 
 class MLPKernel(torch.nn.Module):

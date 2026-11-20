@@ -12,6 +12,7 @@ __all__ = ["model_dict", "model_factory", "model_names", "model_spec"]
 _MODEL_MODULES: dict[str, str] = {
     "full_chain": "spine.model.full_chain",
     "graph_spice": "spine.model.graph_spice",
+    "graph_spice_iter": "spine.model.graph_spice.iterate",
     "grappa": "spine.model.grappa",
     "image": "spine.model.image",
     "spice": "spine.model.spice",
